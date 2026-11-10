@@ -1,0 +1,43 @@
+{
+  "name": "pakswap-studio",
+  "productName": "PakSwap Studio",
+  "version": "1.2.0",
+  "description": "3D engine swaps, sound and specs for every Pakistani car",
+  "main": "main.js",
+  "author": "PakSwap Studio",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable nsis --x64",
+    "dist:linux": "electron-builder --linux AppImage tar.gz deb --x64",
+    "dist": "electron-builder --win portable --linux AppImage tar.gz --x64"
+  },
+  "devDependencies": {
+    "electron": "31.7.7",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "pk.pakswap.studio",
+    "productName": "PakSwap Studio",
+    "copyright": "PakSwap Studio",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["main.js", "app/**/*", "build/icon.png"],
+    "artifactName": "PakSwap-Studio-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [{ "target": "portable", "arch": ["x64"] }, { "target": "nsis", "arch": ["x64"] }]
+    },
+    "portable": { "artifactName": "PakSwap-Studio-${version}-portable.exe" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "artifactName": "PakSwap-Studio-${version}-setup.exe", "shortcutName": "PakSwap Studio" },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Game",
+      "synopsis": "3D car modding and engine swap studio",
+      "target": ["AppImage", "tar.gz", "deb"],
+      "maintainer": "PakSwap Studio <noreply@pakswap.local>"
+    },
+    "deb": { "depends": ["libgtk-3-0", "libnss3", "libxss1", "libasound2"] }
+  }
+}

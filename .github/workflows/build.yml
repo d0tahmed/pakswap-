@@ -1,0 +1,70 @@
+name: Build apps
+
+# Builds the Windows and Linux apps. Push a tag like v1.2.0 to also publish a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            args: --linux AppImage tar.gz --x64
+          - name: Windows
+            os: windows-latest
+            args: --win portable nsis --x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Bundle the web build
+        run: node build.mjs
+
+      - name: Copy the web build into the desktop shell
+        run: node -e "const fs=require('fs');fs.mkdirSync('desktop/app',{recursive:true});fs.copyFileSync('dist/index.html','desktop/app/index.html')"
+
+      - name: Install desktop dependencies
+        run: npm install
+        working-directory: desktop
+
+      - name: Package the app
+        run: npx electron-builder ${{ matrix.args }}
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pakswap-${{ matrix.name }}
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.AppImage
+            desktop/release/*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/release/*.exe
+            desktop/release/*.AppImage
+            desktop/release/*.tar.gz
+            PakSwap-Studio.html

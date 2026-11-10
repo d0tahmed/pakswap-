@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+desktop/app/
+desktop/release/
+builds/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
