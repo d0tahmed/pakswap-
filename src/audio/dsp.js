@@ -78,7 +78,7 @@ export class EngineDSP {
   message(m) {
     if (!m) return;
     if (m.type === 'profile') this.setProfile(m.profile);
-    else if (m.type === 'state') Object.assign(this.target, m.state);
+    else if (m.type === 'state') { const t = this.target, st = m.state; for (const k in st) t[k] = st[k]; }
     else if (m.type === 'trigger') this.trigger(m.name, m.value);
   }
 
@@ -325,10 +325,10 @@ export class EngineDSP {
       }
       if (pop !== 0) pop = this.bq(this.f.popLp, pop) * 2.2;
       // exhaust banks
-      const bankIn = [b0 + pop * 0.6, b1 + pop * 0.6];
+      const popIn = pop * 0.6;
       for (let bi = 0; bi < 2; bi++) {
         const bk = this.bank[bi];
-        let x = bankIn[bi];
+        let x = (bi === 0 ? b0 : b1) + popIn;
         bk.env += (Math.abs(x) - bk.env) * 0.004;
         const turb = this.noise() * bk.env * raspAmt;
         x += this.bq(bk.rasp, turb) * 1.5;
@@ -497,8 +497,7 @@ export class EngineDSP {
       if (this.horn > 0.005) {
         this.hornPh1 += 415 / sr; this.hornPh2 += 497 / sr;
         if (this.hornPh1 > 1) this.hornPh1 -= 1; if (this.hornPh2 > 1) this.hornPh2 -= 1;
-        const sq = (ph) => Math.tanh(Math.sin(2 * Math.PI * ph) * 3.2);
-        const hs = this.bq(this.f.horn, sq(this.hornPh1) + sq(this.hornPh2) * 0.85) * this.horn * 0.42;
+        const hs = this.bq(this.f.horn, Math.tanh(Math.sin(2 * Math.PI * this.hornPh1) * 3.2) + Math.tanh(Math.sin(2 * Math.PI * this.hornPh2) * 3.2) * 0.85) * this.horn * 0.42;
         outL += hs; outR += hs;
       }
       if (this.speed > 5) { const w = this.bq(this.f.wind, this.noise()) * Math.min(0.3, this.speed * this.speed * 0.000011); outL += w; outR += w * 0.94; }

@@ -2,7 +2,7 @@
 // the village, motorway furniture, service areas, poles and wires, trees, plus the drift park.
 import * as THREE from 'three';
 import * as TX from './textures.js';
-import { truckArtTexture } from '../three/textures.js';
+import { makeTruckArt } from '../three/textures.js';
 import { WorldView, parkMacroTexture, GB } from './worldView.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { S_ASPHALT, S_GRASS } from './track.js';
@@ -50,10 +50,67 @@ export class OpenWorldView {
     this.buildTrees();
     this.buildTrucks();
     this.buildGrass();
-    // fewer draw calls: bake everything static into one mesh per material
-    const skip = new Set([...this.chunks.map((c) => c.mesh), this.water, this.grass].filter(Boolean));
-    this.merged = mergeStatic(this.group, skip, this.disposables);
+    // Static scenery is baked into one mesh per material *per map cell*, and instanced props
+    // (10,000 trees, poles, lamps) are split the same way. A cell that is out of view is skipped
+    // whole, so the GPU only ever sees the part of the 5 km map the camera or the sun's shadow
+    // box can reach, instead of every triangle of it on every frame.
+    this.cells = new Map();
+    this.cellList = [];
+    const skip = new Set([...this.chunks.map((c) => c.mesh), this.water, this.grass, this.park.cones, this.park.pools].filter(Boolean));
+    this.merged = mergeStatic(this.group, skip, this.disposables, (o, cx, cz) => this.cellFor(cx, cz).add(o));
+    this.split = splitInstanced(this.group, skip, (o, cx, cz) => this.cellFor(cx, cz).add(o));
+    for (const c of this.cellList) {
+      const box = new THREE.Box3();
+      for (const o of c.children) {
+        if (o.isInstancedMesh) { o.computeBoundingSphere(); box.union(new THREE.Box3().setFromCenterAndSize(o.boundingSphere.center, new THREE.Vector3().setScalar(o.boundingSphere.radius * 2))); }
+        else { if (!o.geometry.boundingBox) o.geometry.computeBoundingBox(); box.union(o.geometry.boundingBox); }
+      }
+      c.userData.bs = box.getBoundingSphere(new THREE.Sphere());
+    }
+    // the source geometry of everything that was baked is no longer referenced by any mesh:
+    // let go of it (it would otherwise sit in memory twice for as long as the world lives)
+    const live = new Set();
+    this.group.traverse((o) => { if (o.geometry) live.add(o.geometry); });
+    for (const v of this.geoCache.values()) live.add(v.g);
+    this.disposables = this.disposables.filter((d) => !d.isBufferGeometry || live.has(d));
+    this.park.disposables = this.park.disposables.filter((d) => !d.isBufferGeometry || live.has(d));
+    this.frustum = new THREE.Frustum();
+    this.pm = new THREE.Matrix4();
+    this.lodT = 0;
+    this.lampPick = { t: 0, idx: new Int32Array(8).fill(-1), d2: new Float64Array(8) };
+    this.terrainAt = { x: Infinity, y: Infinity, pending: true };
     this.ms = performance.now() - t0;
+  }
+
+  cellFor(x, z) {
+    const key = (Math.floor(x / CELL) + 512) * 4096 + (Math.floor(z / CELL) + 512);
+    let g = this.cells.get(key);
+    if (!g) { g = new THREE.Group(); g.name = 'cell'; this.cells.set(key, g); this.cellList.push(g); this.group.add(g); }
+    return g;
+  }
+
+  // Coarse culling of the map cells: one sphere test per cell, every frame. A cell near the
+  // camera stays on even when it is behind it, because it can still cast shadows into view.
+  cullCells(camera, dt) {
+    camera.updateMatrixWorld();
+    this.pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    this.frustum.setFromProjectionMatrix(this.pm);
+    const cp = camera.position;
+    this.lodT -= dt;
+    const lod = this.lodT <= 0;
+    if (lod) this.lodT = 0.25;
+    for (let i = 0; i < this.cellList.length; i++) {
+      const c = this.cellList[i], bs = c.userData.bs;
+      const dx = bs.center.x - cp.x, dy = bs.center.y - cp.y, dz = bs.center.z - cp.z;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - bs.radius;
+      const vis = d < 190 || this.frustum.intersectsSphere(bs);
+      if (c.visible !== vis) c.visible = vis;
+      // small props drop out with distance; checked a few times a second
+      if (lod && vis) {
+        const ch = c.children;
+        for (let k = 0; k < ch.length; k++) { const o = ch[k], md = o.userData.maxDist; if (md !== undefined) { const v = d < md; if (o.visible !== v) o.visible = v; } }
+      }
+    }
   }
 
   track(o) { this.disposables.push(o); return o; }
@@ -288,10 +345,10 @@ export class OpenWorldView {
       if (lod !== ch.lod) want.push([d, ch, lod]);
     }
     want.sort((a, b) => a[0] - b[0]);
-    let built = 0;
+    let built = 0, pending = false;
     for (const [, ch, lod] of want) {
       const key = `${ch.ci},${ch.cj},${lod}`;
-      if (!this.geoCache.has(key)) { if (built >= budget && lod <= 1) continue; built++; }
+      if (!this.geoCache.has(key)) { if (built >= budget && lod <= 1) { pending = true; continue; } built++; }
       ch.mesh.geometry = this.chunkGeo(ch.ci, ch.cj, lod);
       ch.lod = lod;
     }
@@ -301,6 +358,7 @@ export class OpenWorldView {
       const old = [...this.geoCache.entries()].filter(([k, v]) => !inUse.has(k) && v.lod <= 1).sort((a, b) => a[1].used - b[1].used);
       for (const [k, v] of old.slice(0, old.length - 20)) { v.g.dispose(); this.geoCache.delete(k); }
     }
+    return pending;
   }
 
   // ---------------------------------------------------------------- lake
@@ -1066,7 +1124,7 @@ export class OpenWorldView {
     for (const [name, K] of Object.entries(kinds)) {
       const list = Wd.trees.filter((t) => t.kind === name);
       if (!list.length) continue;
-      const tg = this.track(new THREE.CylinderGeometry(K.trunkR * 0.7, K.trunkR, K.trunkH + 1, 6)); tg.translate(0, (K.trunkH + 1) / 2, 0);
+      const tg = this.track(new THREE.CylinderGeometry(K.trunkR * 0.7, K.trunkR, K.trunkH + 1, 6, 1, true)); tg.translate(0, (K.trunkH + 1) / 2, 0);
       const trunks = new THREE.InstancedMesh(tg, trunkMat, list.length);
       const crowns = new THREE.InstancedMesh(K.crown, K.mat, list.length);
       list.forEach((t, i) => {
@@ -1080,6 +1138,8 @@ export class OpenWorldView {
       });
       trunks.castShadow = true; trunks.receiveShadow = true;
       crowns.castShadow = true; crowns.receiveShadow = true;
+      trunks.userData.maxDist = 650; // a trunk is a few pixels wide beyond this; the crown carries the tree
+      crowns.userData.maxDist = Infinity; // forests stay on the far hills
       this.group.add(trunks, crowns);
     }
   }
@@ -1100,7 +1160,7 @@ export class OpenWorldView {
 
   makeTruck(base) {
     const grp = new THREE.Group();
-    const art = truckArtTexture(base);
+    const art = this.track(makeTruckArt(base));
     const artMat = this.track(new THREE.MeshStandardMaterial({ map: art, roughness: 0.45, metalness: 0.1 }));
     const cabMat = this.track(new THREE.MeshStandardMaterial({ color: base, roughness: 0.4, metalness: 0.2 }));
     const wood = this.track(new THREE.MeshStandardMaterial({ color: '#8a5a32', roughness: 0.8 }));
@@ -1204,28 +1264,50 @@ export class OpenWorldView {
     this.night = on;
     this.uNight.value = on ? 1 : 0;
     this.park.setNight(on);
+    // lights that are off are taken out of the scene, so daytime shaders do not loop over them
+    for (const l of this.park.nightLights) l.visible = on;
     this.emissiveLamp.emissiveIntensity = on ? 8 : 0;
     if (this.signMat) this.signMat.emissiveIntensity = on ? 0.55 : 0;
     if (this.towerMat) this.towerMat.emissiveIntensity = on ? 0.85 : 0;
   }
 
-  update(dt, cx, cy, camX, camY) {
+  update(dt, cx, cy, camX, camY, camera) {
     this.uTime.value += dt;
-    this.updateTerrain(camX ?? cx, camY ?? cy);
-    this.updateGrass(camX ?? cx, camY ?? cy);
+    const px = camX ?? cx, py = camY ?? cy;
+    // terrain detail follows the camera; re-evaluated when it has moved, or while chunks are
+    // still waiting for their turn in the build budget
+    const T = this.terrainAt;
+    if (T.pending || Math.abs(px - T.x) + Math.abs(py - T.y) > 12) { T.x = px; T.y = py; T.pending = this.updateTerrain(px, py); }
+    this.updateGrass(px, py);
+    if (camera) this.cullCells(camera, dt);
     if (this.waterNormal) { this.waterNormal.offset.x += dt * 0.004; this.waterNormal.offset.y += dt * 0.0025; }
     this.park.uTime.value += dt;
     // at night a few real lights hop to the lamps nearest the car
     const L = this.park.nightLights;
-    if (!this.night) { for (const l of L) l.intensity = 0; return; }
-    const z = -cy;
-    const near = this.lamps.map((p, i) => [i, (p.x - cx) ** 2 + (p.z - z) ** 2]).sort((a, b) => a[1] - b[1]).slice(0, L.length);
-    near.forEach(([i, d2], k) => {
-      const pl = L[k];
-      pl.position.copy(this.lamps[i]);
-      pl.intensity = 480 * Math.max(0, 1 - Math.sqrt(d2) / 90);
+    if (!this.night) { if (this.lampsLit) { for (const l of L) l.intensity = 0; this.lampsLit = false; } return; }
+    this.lampsLit = true;
+    const P = this.lampPick, n = Math.min(L.length, P.idx.length), lamps = this.lamps, z = -cy;
+    P.t -= dt;
+    if (P.t <= 0) {
+      // choose the nearest lamps a few times a second (a partial selection, no sorting, no garbage)
+      P.t = 0.2;
+      for (let k = 0; k < n; k++) { P.idx[k] = -1; P.d2[k] = Infinity; }
+      for (let i = 0; i < lamps.length; i++) {
+        const p = lamps[i], d2 = (p.x - cx) * (p.x - cx) + (p.z - z) * (p.z - z);
+        if (d2 >= P.d2[n - 1]) continue;
+        let k = n - 1;
+        while (k > 0 && P.d2[k - 1] > d2) { P.d2[k] = P.d2[k - 1]; P.idx[k] = P.idx[k - 1]; k--; }
+        P.d2[k] = d2; P.idx[k] = i;
+      }
+    }
+    for (let k = 0; k < n; k++) {
+      const pl = L[k], i = P.idx[k];
+      if (i < 0) { pl.intensity = 0; continue; }
+      const p = lamps[i];
+      pl.position.copy(p);
+      pl.intensity = 480 * Math.max(0, 1 - Math.sqrt((p.x - cx) * (p.x - cx) + (p.z - z) * (p.z - z)) / 90);
       pl.distance = 80;
-    });
+    }
   }
 
   dispose() {
@@ -1238,9 +1320,67 @@ export class OpenWorldView {
 void S_ASPHALT; void S_GRASS;
 
 
-// Bake static meshes into one mesh per material (and shadow flags), so the world draws in far
-// fewer calls. Instanced, multi-material and listed meshes are left alone.
-function mergeStatic(root, skip, disposables) {
+// ---------------------------------------------------------------- spatial batching
+const CELL = 325; // metres; the map is 16 x 16 of these
+const MAX_DIST = [900, 2800]; // small and medium props stop being drawn beyond these distances
+
+function maxScale(m) {
+  const e = m.elements;
+  return Math.sqrt(Math.max(e[0] * e[0] + e[1] * e[1] + e[2] * e[2], e[4] * e[4] + e[5] * e[5] + e[6] * e[6], e[8] * e[8] + e[9] * e[9] + e[10] * e[10]));
+}
+
+// Cut a geometry into one piece per map cell, by the centre of each triangle.
+function splitByCell(geo, cell) {
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
+  if (bb.max.x - bb.min.x <= cell * 1.15 && bb.max.z - bb.min.z <= cell * 1.15) return [geo];
+  const pos = geo.getAttribute('position').array;
+  const index = geo.index ? geo.index.array : null;
+  const nTri = Math.floor((index ? index.length : pos.length / 3) / 3);
+  const ids = new Int32Array(nTri);
+  const counts = new Map();
+  for (let t = 0; t < nTri; t++) {
+    const a = index ? index[t * 3] : t * 3, b = index ? index[t * 3 + 1] : t * 3 + 1, c = index ? index[t * 3 + 2] : t * 3 + 2;
+    const x = (pos[a * 3] + pos[b * 3] + pos[c * 3]) / 3, z = (pos[a * 3 + 2] + pos[b * 3 + 2] + pos[c * 3 + 2]) / 3;
+    const id = (Math.floor(x / cell) + 512) * 4096 + (Math.floor(z / cell) + 512);
+    ids[t] = id; counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  if (counts.size === 1) return [geo];
+  const groups = new Map();
+  for (const [id, n] of counts) groups.set(id, { tris: new Uint32Array(n), k: 0 });
+  for (let t = 0; t < nTri; t++) { const g = groups.get(ids[t]); g.tris[g.k++] = t; }
+  const names = Object.keys(geo.attributes);
+  const remap = new Int32Array(pos.length / 3).fill(-1);
+  const out = [];
+  for (const { tris } of groups.values()) {
+    const used = [];
+    const idx = new Uint32Array(tris.length * 3);
+    for (let k = 0; k < tris.length; k++) for (let c = 0; c < 3; c++) {
+      const vi = index ? index[tris[k] * 3 + c] : tris[k] * 3 + c;
+      let ni = remap[vi];
+      if (ni < 0) { ni = used.length; remap[vi] = ni; used.push(vi); }
+      idx[k * 3 + c] = ni;
+    }
+    const g = new THREE.BufferGeometry();
+    for (const name of names) {
+      const a = geo.attributes[name], size = a.itemSize, src = a.array;
+      const arr = new src.constructor(used.length * size);
+      for (let i = 0; i < used.length; i++) { const o = used[i] * size; for (let c = 0; c < size; c++) arr[i * size + c] = src[o + c]; }
+      g.setAttribute(name, new THREE.BufferAttribute(arr, size, a.normalized));
+    }
+    g.setIndex(new THREE.BufferAttribute(used.length > 65535 ? idx : Uint16Array.from(idx), 1));
+    for (let i = 0; i < used.length; i++) remap[used[i]] = -1;
+    g.computeBoundingBox(); g.computeBoundingSphere();
+    out.push(g);
+  }
+  geo.dispose();
+  return out;
+}
+
+// Bake static meshes into one mesh per material, shadow flags and size class, then cut each of
+// those along the map cells. `place(mesh, x, z)` files a piece under its cell. Instanced,
+// multi-material and listed meshes are left alone.
+function mergeStatic(root, skip, disposables, place) {
   root.updateMatrixWorld(true);
   const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
   const buckets = new Map();
@@ -1248,28 +1388,81 @@ function mergeStatic(root, skip, disposables) {
     if (!o.isMesh || o.isInstancedMesh || skip.has(o) || Array.isArray(o.material) || o.userData.keep) return;
     const g = o.geometry;
     if (!g || !g.getAttribute('position') || g.morphAttributes?.position) return;
+    if (!g.boundingSphere) g.computeBoundingSphere();
+    const r = g.boundingSphere.radius * maxScale(o.matrixWorld);
+    const cls = r < 3.2 ? 0 : r < 16 ? 1 : 2;
     const attrs = Object.keys(g.attributes).sort().join(',');
-    const key = `${o.material.uuid}|${g.index ? 'i' : 'n'}|${attrs}|${o.castShadow ? 1 : 0}${o.receiveShadow ? 1 : 0}|${o.renderOrder}`;
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(o);
+    const key = `${o.material.uuid}|${g.index ? 'i' : 'n'}|${attrs}|${o.castShadow ? 1 : 0}${o.receiveShadow ? 1 : 0}|${o.renderOrder}|${cls}`;
+    if (!buckets.has(key)) buckets.set(key, { list: [], cls });
+    buckets.get(key).list.push(o);
   });
   let removed = 0, added = 0;
   const M = new THREE.Matrix4();
-  for (const list of buckets.values()) {
-    if (list.length < 2) continue;
+  for (const { list, cls } of buckets.values()) {
     const geos = list.map((o) => { M.multiplyMatrices(inv, o.matrixWorld); const g = o.geometry.clone(); g.applyMatrix4(M); return g; });
     let merged = null;
-    try { merged = mergeGeometries(geos, false); } catch (e) { merged = null; }
-    for (const g of geos) g.dispose();
+    if (geos.length === 1) merged = geos[0];
+    else {
+      try { merged = mergeGeometries(geos, false); } catch (e) { merged = null; }
+      for (const g of geos) g.dispose();
+    }
     if (!merged) continue;
-    merged.computeBoundingSphere();
     const src = list[0];
-    const mesh = new THREE.Mesh(merged, src.material);
-    mesh.castShadow = src.castShadow; mesh.receiveShadow = src.receiveShadow; mesh.renderOrder = src.renderOrder;
-    root.add(mesh);
-    disposables.push(merged);
     for (const o of list) { o.parent.remove(o); removed++; }
-    added++;
+    for (const part of splitByCell(merged, CELL)) {
+      if (!part.boundingSphere) part.computeBoundingSphere();
+      if (!part.boundingBox) part.computeBoundingBox();
+      const mesh = new THREE.Mesh(part, src.material);
+      mesh.castShadow = src.castShadow; mesh.receiveShadow = src.receiveShadow; mesh.renderOrder = src.renderOrder;
+      mesh.matrixAutoUpdate = false;
+      if (cls < 2) mesh.userData.maxDist = MAX_DIST[cls];
+      disposables.push(part);
+      const c = part.boundingSphere.center;
+      place(mesh, c.x, c.z);
+      added++;
+    }
   }
   return { removed, added };
+}
+
+// Split every instanced mesh into one instanced mesh per map cell, so frustum culling works on
+// them (a single mesh holding the whole forest has a bounding sphere the size of the map).
+function splitInstanced(root, skip, place) {
+  const list = [];
+  root.traverse((o) => { if (o.isInstancedMesh && !skip.has(o) && !o.userData.keep && o.count > 0) list.push(o); });
+  const M = new THREE.Matrix4(), W = new THREE.Matrix4(), col = new THREE.Color();
+  let made = 0;
+  for (const im of list) {
+    im.updateWorldMatrix(true, false);
+    const groups = new Map();
+    for (let i = 0; i < im.count; i++) {
+      im.getMatrixAt(i, M); W.multiplyMatrices(im.matrixWorld, M);
+      const id = (Math.floor(W.elements[12] / CELL) + 512) * 4096 + (Math.floor(W.elements[14] / CELL) + 512);
+      let g = groups.get(id);
+      if (!g) { g = []; groups.set(id, g); }
+      g.push(i);
+    }
+    if (!im.geometry.boundingSphere) im.geometry.computeBoundingSphere();
+    const r = im.geometry.boundingSphere.radius;
+    for (const ids of groups.values()) {
+      const part = new THREE.InstancedMesh(im.geometry, im.material, ids.length);
+      let sx = 0, sz = 0;
+      for (let k = 0; k < ids.length; k++) {
+        im.getMatrixAt(ids[k], M); W.multiplyMatrices(im.matrixWorld, M);
+        part.setMatrixAt(k, W);
+        if (im.instanceColor) { im.getColorAt(ids[k], col); part.setColorAt(k, col); }
+        sx += W.elements[12]; sz += W.elements[14];
+      }
+      part.instanceMatrix.needsUpdate = true;
+      if (part.instanceColor) part.instanceColor.needsUpdate = true;
+      part.castShadow = im.castShadow; part.receiveShadow = im.receiveShadow; part.renderOrder = im.renderOrder;
+      part.matrixAutoUpdate = false;
+      part.userData.maxDist = im.userData.maxDist ?? (r < 3.2 ? MAX_DIST[0] : r < 9 ? MAX_DIST[1] : undefined);
+      place(part, sx / ids.length, sz / ids.length);
+      made++;
+    }
+    im.parent.remove(im);
+    im.dispose();
+  }
+  return { from: list.length, made };
 }

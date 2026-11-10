@@ -219,7 +219,13 @@ export function windowTexture() {
 }
 
 // ---------------- number plate ----------------
+// Plates are shared between the front and rear decals and across rebuilds. They are reference
+// counted so a texture is freed as soon as no decal shows that text any more.
+const plates = new Map();
 export function plateTexture(text) {
+  const t = (text || '').toUpperCase().slice(0, 10);
+  let e = plates.get(t);
+  if (e) { e.refs++; return e.tex; }
   const W = 512, H = 128;
   const [c, x] = canvas(W, H);
   rr(x, 2, 2, W - 4, H - 4, 12); x.fillStyle = '#f7f7f2'; x.fill();
@@ -229,18 +235,34 @@ export function plateTexture(text) {
   x.fillText('PK', 45, H / 2 + 8);
   x.beginPath(); x.arc(45, 34, 9, 0.6, 5.7); x.lineWidth = 3; x.strokeStyle = '#fff'; x.stroke();
   x.fillStyle = '#121212';
-  const t = (text || '').toUpperCase().slice(0, 10);
   let size = 78;
   x.font = `700 ${size}px "Chakra Petch", "Arial Black", sans-serif`;
   while (x.measureText(t).width > W - 120 && size > 30) { size -= 4; x.font = `700 ${size}px "Chakra Petch", "Arial Black", sans-serif`; }
   x.textAlign = 'center'; x.textBaseline = 'middle';
   x.fillText(t, (W + 76) / 2, H / 2 + 4);
-  return tex(c);
+  e = { tex: tex(c), refs: 1 };
+  e.tex.userData.plate = t;
+  plates.set(t, e);
+  return e.tex;
+}
+export function releasePlate(texture) {
+  if (!texture || texture.userData.plate == null) return;
+  const e = plates.get(texture.userData.plate);
+  if (!e || e.tex !== texture) return;
+  if (--e.refs <= 0) { plates.delete(texture.userData.plate); texture.dispose(); }
 }
 
 // ---------------- liveries ----------------
+let truckArt = null;
 export function truckArtTexture(base) {
-  return cached(`truck-${base}`, () => {
+  if (truckArt && truckArt.base === base) return truckArt.tex;
+  if (truckArt) truckArt.tex.dispose();
+  truckArt = { base, tex: makeTruckArt(base) };
+  return truckArt.tex;
+}
+// An unshared truck-art texture; the caller owns it and disposes it.
+export function makeTruckArt(base) {
+  {
     const W = 1024, H = 512;
     const [c, x] = canvas(W, H);
     x.fillStyle = base; x.fillRect(0, 0, W, H);
@@ -288,7 +310,7 @@ export function truckArtTexture(base) {
     // mirror dots
     for (let i = 0; i < 64; i++) { x.fillStyle = '#ffffff'; x.beginPath(); x.arc(8 + i * 16, 392, 4, 0, Math.PI * 2); x.fill(); x.fillStyle = '#1f6fd1'; x.beginPath(); x.arc(16 + i * 16, 404, 3, 0, Math.PI * 2); x.fill(); }
     return tex(c, { repeat: true });
-  });
+  }
 }
 
 export function camoTexture() {
@@ -338,31 +360,93 @@ export function checkerTexture() {
 }
 
 // ---------------- tyres and studio ----------------
-export function treadTexture(kind) {
-  return cached(`tread-${kind}`, () => {
-    const W = 1024, H = 128;
-    const [c, x] = canvas(W, H);
-    x.fillStyle = '#808080'; x.fillRect(0, 0, W, H);
-    // v maps across the tyre profile; tread zone is the middle band
-    if (kind === 'at') {
-      for (let i = 0; i < 64; i++) {
-        x.fillStyle = '#d0d0d0';
-        const off = i % 2 ? 6 : 0;
-        x.fillRect(i * 16 + 2, 36 + off, 11, 22); x.fillRect(i * 16 + 4, 64 - off, 11, 26);
-      }
-    } else if (kind === 'semislick' || kind === 'drag') {
-      x.fillStyle = '#c4c4c4'; x.fillRect(0, 40, W, 48);
-      x.fillStyle = '#6a6a6a'; x.fillRect(0, 62, W, 4);
-    } else {
-      x.fillStyle = '#c8c8c8'; x.fillRect(0, 38, W, 52);
-      x.fillStyle = '#5a5a5a'; for (const y of [50, 64, 78]) x.fillRect(0, y, W, 4);
-      x.strokeStyle = '#5a5a5a'; x.lineWidth = 3;
-      for (let i = 0; i < W; i += 14) { x.beginPath(); x.moveTo(i, 38); x.lineTo(i + 9, 50); x.stroke(); x.beginPath(); x.moveTo(i + 6, 90); x.lineTo(i - 3, 78); x.stroke(); }
+// Height map for a tyre: u runs round the circumference, v across the section
+// (inboard sidewall 0 to 0.3, tread 0.3 to 0.7, outboard sidewall 0.7 to 1). The outboard sidewall
+// carries raised lettering with the real size of the tyre that is fitted.
+const tyres = new Map();
+let tyreStamp = 0;
+export function tyreTexture(kind, label) {
+  const key = `${kind}|${label}`;
+  let e = tyres.get(key);
+  if (e) { e.refs++; e.used = ++tyreStamp; return e.tex; }
+  const W = 2048, H = 256;
+  const [c, x] = canvas(W, H);
+  const base = '#7c7c7c';
+  x.fillStyle = base; x.fillRect(0, 0, W, H);
+  // canvas rows: 0 = outboard bead ... 0.3H = outboard shoulder ... 0.7H = inboard shoulder ... H = inboard bead
+  const t0 = H * 0.3, t1 = H * 0.7, th = t1 - t0;
+  x.fillStyle = '#c4c4c4'; x.fillRect(0, t0, W, th);
+  const groove = '#3c3c3c';
+  if (kind === 'at') {
+    // chunky staggered blocks with open shoulders
+    x.fillStyle = groove; x.fillRect(0, t0, W, th);
+    x.fillStyle = '#d8d8d8';
+    const n = 56, bw = W / n;
+    for (let i = 0; i < n; i++) {
+      const off = i % 2 ? bw * 0.5 : 0;
+      x.fillRect(i * bw + 3, t0 + 2, bw - 9, th * 0.24);
+      x.fillRect(i * bw + off + 3, t0 + th * 0.31, bw - 10, th * 0.17);
+      x.fillRect(i * bw + (off ? 0 : bw * 0.5) + 3, t0 + th * 0.53, bw - 10, th * 0.17);
+      x.fillRect(i * bw + 3, t0 + th * 0.76, bw - 9, th * 0.24 - 2);
     }
-    const t = tex(c, { linear: true });
-    t.wrapS = THREE.RepeatWrapping;
-    return t;
-  });
+    // sidewall lugs
+    x.fillStyle = '#9a9a9a';
+    for (let i = 0; i < n; i++) { x.fillRect(i * bw + 6, t0 - 16, bw * 0.5, 16); x.fillRect(i * bw + 6, t1, bw * 0.5, 16); }
+  } else if (kind === 'drag') {
+    // slick with two shallow wear grooves
+    x.fillStyle = '#b8b8b8'; x.fillRect(0, t0, W, th);
+    x.fillStyle = '#7a7a7a'; x.fillRect(0, t0 + th * 0.33, W, 3); x.fillRect(0, t0 + th * 0.66, W, 3);
+  } else if (kind === 'semislick') {
+    x.fillStyle = groove; x.fillRect(0, t0 + th * 0.36, W, 6); x.fillRect(0, t0 + th * 0.62, W, 6);
+    x.strokeStyle = groove; x.lineWidth = 5;
+    for (let i = 0; i < W; i += 64) { x.beginPath(); x.moveTo(i, t0 + 2); x.lineTo(i + 30, t0 + th * 0.2); x.stroke(); x.beginPath(); x.moveTo(i + 32, t1 - 2); x.lineTo(i + 2, t1 - th * 0.2); x.stroke(); }
+  } else {
+    // road tyre: four circumferential grooves and angled sipes on the shoulders
+    x.fillStyle = groove;
+    for (const f of [0.2, 0.4, 0.6, 0.8]) x.fillRect(0, t0 + th * f - 4, W, 8);
+    x.strokeStyle = groove; x.lineWidth = 4;
+    for (let i = 0; i < W; i += 26) {
+      x.beginPath(); x.moveTo(i, t0); x.lineTo(i + 14, t0 + th * 0.17); x.stroke();
+      x.beginPath(); x.moveTo(i + 13, t1); x.lineTo(i - 1, t1 - th * 0.17); x.stroke();
+      x.beginPath(); x.moveTo(i + 4, t0 + th * 0.43); x.lineTo(i + 16, t0 + th * 0.57); x.stroke();
+    }
+  }
+  // shoulder blend and sidewall rings
+  for (const [y, d] of [[t0, -1], [t1, 1]]) {
+    const g = x.createLinearGradient(0, y, 0, y + d * 12);
+    g.addColorStop(0, 'rgba(124,124,124,0.9)'); g.addColorStop(1, 'rgba(124,124,124,0)');
+    x.fillStyle = g; x.fillRect(0, Math.min(y, y + d * 12), W, 12);
+  }
+  x.fillStyle = '#929292';
+  for (const y of [H * 0.035, H * 0.255, H * 0.745, H * 0.965]) x.fillRect(0, y - 1.5, W, 3);
+  // raised lettering on the outboard sidewall, twice round the tyre
+  const band = t0 - H * 0.07, cy = H * 0.05 + band / 2;
+  x.fillStyle = '#d6d6d6'; x.textAlign = 'center'; x.textBaseline = 'middle';
+  const draw = (txt, cx, px, weight = 700) => {
+    x.save(); x.translate(cx, cy); x.scale(1.75, -1);
+    x.font = `${weight} ${px}px "Chakra Petch", "Arial Narrow", Arial, sans-serif`;
+    x.fillText(txt, 0, 1); x.restore();
+  };
+  for (let k = 0; k < 2; k++) {
+    const o = k * W / 2;
+    draw('PAKSWAP', o + W * 0.115, band * 0.78);
+    draw(label, o + W * 0.36, band * 0.62, 600);
+  }
+  const tx = tex(c, { linear: true });
+  tx.wrapS = THREE.RepeatWrapping;
+  tx.anisotropy = 8;
+  tx.userData.tyreKey = key;
+  e = { tex: tx, refs: 1, used: ++tyreStamp };
+  tyres.set(key, e);
+  return tx;
+}
+export function releaseTyreTexture(texture) {
+  const e = tyres.get(texture.userData.tyreKey);
+  if (!e || e.tex !== texture) return;
+  e.refs = Math.max(0, e.refs - 1);
+  // keep a couple of idle sizes so stepping back and forth through rim sizes is instant
+  const idle = [...tyres.entries()].filter(([, v]) => v.refs === 0).sort((p, q) => p[1].used - q[1].used);
+  for (const [k, v] of idle.slice(0, Math.max(0, idle.length - 3))) { v.tex.dispose(); tyres.delete(k); }
 }
 
 export function shadowTexture() {
@@ -402,21 +486,25 @@ export function floorTexture(night) {
   return cached(`floor-${night}`, () => {
     const S = 1024;
     const [c, x] = canvas(S, S);
-    const g = x.createRadialGradient(S / 2, S / 2, S * 0.05, S / 2, S / 2, S / 2);
-    if (night) { g.addColorStop(0, '#3a3530'); g.addColorStop(0.45, '#221f1c'); g.addColorStop(1, '#141210'); }
-    else { g.addColorStop(0, '#f2f0ec'); g.addColorStop(0.5, '#dedad3'); g.addColorStop(1, '#cfcac2'); }
+    const g = x.createRadialGradient(S / 2, S / 2, S * 0.04, S / 2, S / 2, S / 2);
+    if (night) { g.addColorStop(0, '#262a31'); g.addColorStop(0.32, '#171a20'); g.addColorStop(0.7, '#0c0e12'); g.addColorStop(1, '#07080b'); }
+    else { g.addColorStop(0, '#f4f5f6'); g.addColorStop(0.5, '#e2e4e7'); g.addColorStop(1, '#d0d3d7'); }
     x.fillStyle = g; x.fillRect(0, 0, S, S);
-    // polished concrete speckle
+    // polished epoxy speckle
     let seed = 3;
     const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-    for (let i = 0; i < 9000; i++) { x.fillStyle = night ? `rgba(255,255,255,${rnd() * 0.04})` : `rgba(0,0,0,${rnd() * 0.035})`; x.fillRect(rnd() * S, rnd() * S, 2, 2); }
-    // turntable rings
-    x.strokeStyle = night ? 'rgba(245,179,1,0.18)' : 'rgba(60,50,30,0.16)'; x.lineWidth = 3;
+    for (let i = 0; i < 9000; i++) { x.fillStyle = night ? `rgba(255,255,255,${rnd() * 0.03})` : `rgba(0,0,0,${rnd() * 0.03})`; x.fillRect(rnd() * S, rnd() * S, 2, 2); }
+    // turntable: a fine ring with degree ticks, and a wider guide circle
+    const ring = night ? 'rgba(120,214,255,' : 'rgba(40,52,66,';
+    x.strokeStyle = `${ring}0.26)`; x.lineWidth = 2.5;
     x.beginPath(); x.arc(S / 2, S / 2, S * 0.29, 0, Math.PI * 2); x.stroke();
-    x.lineWidth = 1.5; x.beginPath(); x.arc(S / 2, S / 2, S * 0.3, 0, Math.PI * 2); x.stroke();
+    x.strokeStyle = `${ring}0.12)`; x.lineWidth = 1.2;
+    x.beginPath(); x.arc(S / 2, S / 2, S * 0.3, 0, Math.PI * 2); x.stroke();
+    x.beginPath(); x.arc(S / 2, S / 2, S * 0.4, 0, Math.PI * 2); x.stroke();
+    x.strokeStyle = `${ring}0.2)`; x.lineWidth = 1.5;
     for (let i = 0; i < 72; i++) {
       const a = (i / 72) * Math.PI * 2;
-      const r0 = S * 0.3, r1 = S * (i % 6 === 0 ? 0.315 : 0.307);
+      const r0 = S * 0.3, r1 = S * (i % 6 === 0 ? 0.316 : 0.307);
       x.beginPath(); x.moveTo(S / 2 + Math.cos(a) * r0, S / 2 + Math.sin(a) * r0); x.lineTo(S / 2 + Math.cos(a) * r1, S / 2 + Math.sin(a) * r1); x.stroke();
     }
     return tex(c);
@@ -428,8 +516,8 @@ export function backgroundTexture(night) {
     const W = 64, H = 512;
     const [c, x] = canvas(W, H);
     const g = x.createLinearGradient(0, 0, 0, H);
-    if (night) { g.addColorStop(0, '#0d0c0b'); g.addColorStop(0.55, '#1d1a17'); g.addColorStop(1, '#151311'); }
-    else { g.addColorStop(0, '#bdb8b0'); g.addColorStop(0.55, '#e6e2dc'); g.addColorStop(1, '#d6d1c9'); }
+    if (night) { g.addColorStop(0, '#04060a'); g.addColorStop(0.5, '#0b0e14'); g.addColorStop(0.62, '#10141c'); g.addColorStop(1, '#090b10'); }
+    else { g.addColorStop(0, '#c4c8ce'); g.addColorStop(0.55, '#e7e9ec'); g.addColorStop(1, '#d9dce0'); }
     x.fillStyle = g; x.fillRect(0, 0, W, H);
     return tex(c);
   });

@@ -49,7 +49,7 @@ const FEATURED = [
 // ---------------------------------------------------------------- state
 const S = {
   carId: 'suzuki-mehran', cfg: null, a: null, tab: 'engine', carFilter: 'all', carQuery: '', engFilter: 'all', engQuery: '',
-  xray: false, night: true, spin: false, view: 'front', mobile: false, ready: false, custom: null, customRec: null, customBusy: false,
+  xray: false, night: true, spin: false, view: 'front', mobile: false, phone: false, ready: false, custom: null, customRec: null, customBusy: false,
 };
 let studio = null, model = null, THREEmod = null, drive = null;
 const audio = new EngineAudio();
@@ -97,13 +97,22 @@ async function init3D() {
   }
   const [{ Studio }, { CarModel }] = await Promise.all([import('./three/scene.js'), import('./three/carModel.js')]);
   studio = new Studio($('#viewport'));
-  const q = store.get('quality', null);
-  const low = (navigator.hardwareConcurrency || 8) <= 4 || /Mobi|Android/i.test(navigator.userAgent);
-  studio.setQuality(q || (low ? 'medium' : 'high'));
+  studio.onTier = (tier, why) => { applyGlass(); if (why === 'slow') toast(`Graphics set to ${tier} to keep things smooth`); };
+  studio.setQuality(store.get('quality', 'auto'));
+  applyGlass();
   model = new CarModel();
+  model.onChange = () => studio.invalidate(2, true);
   studio.carSlot.add(model.root);
   studio.onFrame.push(frame);
   return true;
+}
+
+// Live blur behind the panels is the costliest part of the interface. "auto" drops it on the
+// low graphics tier; the user can force it either way in Settings.
+function applyGlass() {
+  const g = store.get('glass', 'auto');
+  const solid = g === 'off' || (g === 'auto' && (!studio || studio.tier === 'low'));
+  document.body.classList.toggle('solid', solid);
 }
 
 function buildModel(resetCam = true) {
@@ -129,7 +138,7 @@ function selectCar(id, override, opts = {}) {
   restartEngineSoon();
   renderAll();
   if (!opts.silent) toast(`${c.brand} ${c.model} loaded`);
-  store.set('last', { car: id, cfg: S.cfg });
+  saveLast();
 }
 
 const WHEEL_KEYS = new Set(['rimStyle', 'rimSize', 'tyreWidth', 'tyres', 'brakes']);
@@ -137,7 +146,12 @@ const KIT_KEYS = new Set(['lip', 'skirts', 'diffuser', 'spoiler', 'hood', 'roofA
 const ENGINE_KEYS = new Set(['engineId', 'fi', 'intake', 'drive']);
 const SOUND_KEYS = new Set(['engineId', 'exhaust', 'intake', 'fi', 'ecu', 'nitrous', 'fuelsys']);
 
-function setCfg(patch) {
+let saveT = 0;
+function saveLast() { clearTimeout(saveT); saveT = setTimeout(() => store.set('last', { car: S.carId, cfg: S.cfg }), 250); }
+
+// live: the change comes from a control that is being dragged; the panel is left alone so the
+// control keeps its grip, and only the read-outs are refreshed.
+function setCfg(patch, live = false) {
   const before = S.cfg;
   S.cfg = { ...S.cfg, ...patch };
   const keys = Object.keys(patch).filter((k) => before[k] !== S.cfg[k]);
@@ -162,9 +176,10 @@ function setCfg(patch) {
   }
   if (keys.some((k) => SOUND_KEYS.has(k))) updateAudioEngine();
   if (keys.includes('engineId')) restartEngineSoon();
-  if (visualOnly) { renderHeaderBits(); if (keys.includes('plate')) return; renderPanel(); }
+  saveLast();
+  if (live || (visualOnly && keys.length === 1 && keys[0] === 'plate')) { renderHeaderBits(); if (!visualOnly) renderStats(); return; }
+  if (visualOnly) { renderHeaderBits(); renderPanel(); }
   else renderAll(false);
-  store.set('last', { car: S.carId, cfg: S.cfg });
 }
 
 // ---------------------------------------------------------------- rendering
@@ -216,16 +231,31 @@ const TABS = [
   { id: 'specs', label: 'Specs' },
 ];
 
+const ico = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const TAB_ICON = {
+  cars: ico('<path d="M3 14l2-5a2 2 0 0 1 2-1h10a2 2 0 0 1 2 1l2 5v4h-2.2a2 2 0 0 1-3.6 0H8.8a2 2 0 0 1-3.6 0H3z"/><path d="M5.5 13h13"/>'),
+  engine: ico('<path d="M8 8V5h6v3"/><path d="M3 12v4h2.5l2 3H16l2.5-3H21v-6h-2.5l-2-2H8L5.5 10H3z"/><path d="M10 12.5l-1.5 3h3l-1 2.5"/>'),
+  paint: ico('<path d="M12 3c3.6 4.2 6 7.3 6 10.6A6 6 0 0 1 6 13.6C6 10.3 8.4 7.2 12 3z"/><path d="M9 14a3 3 0 0 0 3 3"/>'),
+  body: ico('<path d="M2 16v-3l3-1 3-4h7l4 4 3 1v3"/><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/><path d="M9 17h6M9.5 12h6"/>'),
+  wheels: ico('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.6"/><path d="M12 3v6.4M12 14.6V21M3.2 9.6l6.3 1.6M14.5 12.8l6.3 1.6M6.2 19l3.9-4.8M13.9 9.8L17.8 5"/>'),
+  tune: ico('<path d="M5 4v6M5 14v6M12 4v2M12 10v10M19 4v9M19 17v3"/><circle cx="5" cy="12" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="19" cy="15" r="2"/>'),
+  specs: ico('<path d="M4 15a8 8 0 0 1 16 0"/><path d="M12 15l4-5"/><path d="M4 19h16"/>'),
+};
+
 function renderTabs() {
   const tabs = TABS.filter((t) => !t.mobileOnly || S.mobile);
   if (!tabs.find((t) => t.id === S.tab)) S.tab = 'engine';
-  $('#tabs').innerHTML = tabs.map((t) => `<button type="button" class="tab" role="tab" id="tab-${t.id}" aria-selected="${S.tab === t.id}" data-tab="${t.id}">${t.label}</button>`).join('');
+  $('#tabs').innerHTML = tabs.map((t) => `<button type="button" class="tab" role="tab" id="tab-${t.id}" aria-selected="${S.tab === t.id}" data-tab="${t.id}">${TAB_ICON[t.id] || ''}<span>${t.label}</span></button>`).join('');
 }
 
+let shownTab = null;
 function renderPanel() {
   const p = $('#panel');
   const scroll = p.scrollTop;
   const fn = { cars: () => `<div style="display:grid;gap:12px">${rackHTML()}</div>`, engine: engineTab, paint: paintTab, body: bodyTab, wheels: wheelsTab, tune: tuneTab, specs: specsTab }[S.tab];
+  // the short entrance animation plays when the tab changes, not on every edit
+  p.classList.toggle('in', shownTab !== S.tab);
+  shownTab = S.tab;
   p.innerHTML = fn();
   p.setAttribute('aria-labelledby', `tab-${S.tab}`);
   p.scrollTop = scroll;
@@ -478,6 +508,9 @@ function renderStats() {
   ].join('');
 }
 
+let volT = 0;
+function volSave(v) { clearTimeout(volT); volT = setTimeout(() => store.set('vol', v), 300); }
+
 // ---------------------------------------------------------------- events
 function parseVal(v, t) { if (t === 'number') return Number(v); if (t === 'null') return null; if (t === 'boolean') return v === 'true'; return v; }
 
@@ -503,19 +536,23 @@ function bindEvents() {
     const t = ev.target;
     if (t.id === 'carSearch') { S.carQuery = t.value; const pos = t.selectionStart; if (S.mobile) renderPanel(); else renderRack(); const n = $('#carSearch'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } }
     if (t.id === 'engSearch') { S.engQuery = t.value; const pos = t.selectionStart; renderPanel(); const n = $('#engSearch'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } }
-    if (t.id === 'tint') { setCfg({ tint: +t.value }); }
+    const note = (txt) => { const em = t.closest('.group')?.querySelector('.label em'); if (em) em.textContent = txt; };
+    if (t.id === 'tint') { setCfg({ tint: +t.value }, true); note(`${S.cfg.tint}%`); }
+    if (t.id === 'rimSize') { setCfg({ rimSize: +t.value }, true); note(`${S.cfg.rimSize} inch (stock ${parseTyre(car().tyre).d})`); }
+    if (t.id === 'rideH') { setCfg({ rideHeight: +t.value }, true); note(`${S.cfg.rideHeight > 0 ? '+' : ''}${S.cfg.rideHeight} mm · clearance ${Math.round(S.a.m.gc)} mm`); }
+    if (t.id === 'paintPick') { setCfg({ paint: t.value }, true); note('Custom'); }
     if (t.id === 'plateIn') { setCfg({ plate: t.value.toUpperCase() }); }
-    if (t.id === 'vol') { audio.setVolume(+t.value); store.set('vol', +t.value); }
+    if (t.id === 'vol') { audio.setVolume(+t.value); volSave(+t.value); }
   });
+  // when a drag ends the whole panel is refreshed once (hints, tyre size line, pressed states)
   document.addEventListener('change', (ev) => {
     const t = ev.target;
-    if (t.id === 'paintPick') setCfg({ paint: t.value });
-    if (t.id === 'rimSize') setCfg({ rimSize: +t.value });
-    if (t.id === 'rideH') setCfg({ rideHeight: +t.value });
+    if (t.id === 'tint' || t.id === 'paintPick') renderPanel();
+    if (t.id === 'rimSize' || t.id === 'rideH') renderAll(false);
   });
   $('#tXray').addEventListener('click', () => { S.xray = !S.xray; $('#tXray').setAttribute('aria-pressed', S.xray); if (model) { model.setXray(S.xray); studio.preset(S.xray ? 'engine' : S.view, model.engineCenter); } });
-  $('#tNight').addEventListener('click', () => { S.night = !S.night; $('#tNight').setAttribute('aria-pressed', S.night); if (studio) { studio.setNight(S.night); model.setNight(S.night); } });
-  $('#tSpin').addEventListener('click', () => { S.spin = !S.spin; $('#tSpin').setAttribute('aria-pressed', S.spin); if (studio) studio.controls.autoRotate = S.spin; });
+  $('#tNight').addEventListener('click', () => { S.night = !S.night; $('#tNight').setAttribute('aria-pressed', S.night); document.body.classList.toggle('day', !S.night); if (studio) { studio.setNight(S.night); model.setNight(S.night); } });
+  $('#tSpin').addEventListener('click', () => { S.spin = !S.spin; $('#tSpin').setAttribute('aria-pressed', S.spin); if (studio) { studio.controls.autoRotate = S.spin; studio.invalidate(); } });
   $('#btnDrive').addEventListener('click', openDrive);
   $('#btnGarage').addEventListener('click', openGarage);
   $('#btnDrag').addEventListener('click', openDrag);
@@ -543,22 +580,39 @@ function bindEvents() {
   $('#slShow').addEventListener('click', revShow);
   $('#slLaunch').addEventListener('click', launch);
   $('#slAB').addEventListener('click', toggleAB);
-  $('#slToggle').addEventListener('click', () => {
-    const el = $('#soundLab'); const open = el.dataset.open !== 'true';
-    el.dataset.open = String(open); $('#slToggle').setAttribute('aria-expanded', open);
-    $('#slToggle').innerHTML = open ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 15l6-6 6 6"/></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>';
-  });
-  const mq = window.matchMedia('(max-width: 760px)');
+  $('#slToggle').addEventListener('click', () => setSoundLab($('#soundLab').dataset.open !== 'true'));
+  // two break points: "compact" hides the car rack (it becomes a Cars tab), "phone" stacks the page
+  const mqPhone = window.matchMedia('(max-width: 760px)'), mqCompact = window.matchMedia('(max-width: 1020px)');
   const onMq = () => {
-    S.mobile = mq.matches;
+    S.phone = mqPhone.matches; S.mobile = mqCompact.matches;
     const strip = $('#statStrip');
-    if (S.mobile) $('#stripHolder').appendChild(strip); else $('.stage-bottom').appendChild(strip);
-    if (S.mobile && $('#soundLab').dataset.open === 'true' && !S.ready) $('#slToggle').click();
+    if (S.phone) $('#stripHolder').appendChild(strip); else $('.stage-bottom').appendChild(strip);
     renderAll();
+    updateInsets();
   };
-  mq.addEventListener ? mq.addEventListener('change', onMq) : mq.addListener(onMq);
-  S.mobile = mq.matches;
-  if (S.mobile) { $('#stripHolder').appendChild($('#statStrip')); $('#soundLab').dataset.open = 'false'; }
+  for (const mq of [mqPhone, mqCompact]) mq.addEventListener ? mq.addEventListener('change', onMq) : mq.addListener(onMq);
+  S.phone = mqPhone.matches; S.mobile = mqCompact.matches;
+  if (S.phone) { $('#stripHolder').appendChild($('#statStrip')); setSoundLab(false); }
+  window.addEventListener('resize', updateInsets);
+}
+
+function setSoundLab(open) {
+  const el = $('#soundLab');
+  el.dataset.open = String(open); $('#slToggle').setAttribute('aria-expanded', open);
+  $('#slToggle').innerHTML = open ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 15l6-6 6 6"/></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>';
+  tachoKey = '';
+  updateInsets();
+}
+
+// Tell the 3D view which part of the window the panels cover, so the car is framed in the rest.
+function updateInsets() {
+  if (!studio) return;
+  if (S.phone || (drive && drive.active)) { studio.setInsets({}); return; }
+  const W = window.innerWidth;
+  const rk = $('#rack').getBoundingClientRect(), dk = $('#desk').getBoundingClientRect(), tp = $('.top').getBoundingClientRect();
+  // the open sound lab takes the lower left of the stage: nudge the car out from under it
+  const lab = $('#soundLab'), labW = lab.dataset.open === 'true' ? lab.getBoundingClientRect().width * 0.5 : 0;
+  studio.setInsets({ left: (rk.width ? rk.right : 0) + labW, right: dk.width ? Math.max(0, W - dk.left) : 0, top: tp.bottom, bottom: 84 });
 }
 
 function setView(v) {
@@ -688,6 +742,8 @@ function updateAudioEngine() {
   const ev = t.engine.fuel === 'electric';
   $('#slStart').textContent = rev.on ? (ev ? 'Power off' : rev.running ? 'Stop engine' : 'Starting...') : ev ? 'Power on' : 'Start engine';
   $('#slNote').textContent = soundNote(t.engine, t.cfg);
+  $('#soundLab').dataset.live = String(!!rev.on);
+  tachoKey = '';
 }
 
 function soundNote(e, cfg) {
@@ -787,7 +843,7 @@ function sampleRun(run, t) {
   return lo;
 }
 
-let flameT = 0, tachoT = 0, wheelDist = 0, lastFrameAt = 0;
+let flameT = 0, tachoT = 0, wheelDist = 0, lastFrameAt = 0, tachoKey = '', labEl = null, tachoEl = null;
 function frame() {
   const now = performance.now();
   const dt = lastFrameAt ? Math.min(0.5, (now - lastFrameAt) / 1000) : 1 / 60;
@@ -865,12 +921,19 @@ function frame() {
     if (sound.launch && !sound.launch.done) model.spinWheels(wheelDist);
   }
   tachoT += dt;
-  if (tachoT > 1 / 30 && $('#soundLab').dataset.open === 'true') {
+  if (!labEl) { labEl = $('#soundLab'); tachoEl = $('#tacho'); }
+  if (tachoT > 1 / 30 && labEl.dataset.open === 'true') {
     tachoT = 0;
-    const t = currentSoundTarget();
-    const ev = t.engine.fuel === 'electric';
-    const maxRpm = ev ? t.curve.maxRpm : Math.ceil((t.curve.redline + 600) / 1000) * 1000;
-    drawTacho($('#tacho'), { rpm: gauge ? gauge.rpm : 0, redline: t.curve.redline, maxRpm, speed: gauge ? gauge.speed : 0, gear: gauge ? gauge.gear : 0, boost: gauge ? gauge.boost : 0, boostOn: t.curve.boost && t.curve.boost.kind !== 'none', ev });
+    const g = gauge || { rpm: 0, speed: 0, gear: 0, boost: 0 };
+    // an idle gauge is not repainted: only draw when the reading moved
+    const key = `${Math.round(g.rpm / 4)}|${Math.round(g.speed * 2)}|${g.gear}|${Math.round(g.boost * 50)}|${S.carId}|${S.cfg.engineId}|${sound.ab}|${tachoEl.clientWidth}`;
+    if (key !== tachoKey) {
+      tachoKey = key;
+      const t = currentSoundTarget();
+      const ev = t.engine.fuel === 'electric';
+      const maxRpm = ev ? t.curve.maxRpm : Math.ceil((t.curve.redline + 600) / 1000) * 1000;
+      drawTacho(tachoEl, { rpm: g.rpm, redline: t.curve.redline, maxRpm, speed: g.speed, gear: g.gear, boost: g.boost, boostOn: t.curve.boost && t.curve.boost.kind !== 'none', ev });
+    }
   }
 }
 
@@ -897,9 +960,10 @@ async function openDrive() {
       buildName: () => `${car().brand} ${car().model} · ${S.a.engine.name}`,
       buildKey,
       setVolume: (v) => { audio.setVolume(v); store.set('vol', v); $('#vol').value = v; },
-      onExit: () => { sound.on = rev.on; updateAudioEngine(); renderHeaderBits(); },
+      onExit: () => { sound.on = rev.on; updateAudioEngine(); renderHeaderBits(); updateInsets(); },
     });
   }
+  updateInsets();
   await drive.enter();
 }
 
@@ -1018,17 +1082,17 @@ function openPhoto() {
     const W = 1400, H = Math.round((W / img.width) * img.height) + 190;
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
     const x = cv.getContext('2d');
-    x.fillStyle = '#121110'; x.fillRect(0, 0, W, H);
+    x.fillStyle = '#05070b'; x.fillRect(0, 0, W, H);
     x.drawImage(img, 0, 0, W, H - 190);
     const a = S.a, m = a.m, c = car();
     const y0 = H - 190;
-    const grd = x.createLinearGradient(0, y0 - 80, 0, y0); grd.addColorStop(0, 'rgba(18,17,16,0)'); grd.addColorStop(1, 'rgba(18,17,16,1)');
+    const grd = x.createLinearGradient(0, y0 - 80, 0, y0); grd.addColorStop(0, 'rgba(5,7,11,0)'); grd.addColorStop(1, 'rgba(5,7,11,1)');
     x.fillStyle = grd; x.fillRect(0, y0 - 80, W, 80);
-    x.fillStyle = '#f5b301'; x.font = '700 18px "Chakra Petch", sans-serif'; x.fillText('PAKSWAP STUDIO', 40, y0 + 34);
-    x.fillStyle = '#efe9e0'; x.font = '700 44px "Chakra Petch", sans-serif'; x.fillText(`${c.brand} ${c.model} · ${a.engine.name}`, 40, y0 + 86);
-    x.fillStyle = '#a69d90'; x.font = '500 20px "Archivo", sans-serif'; x.fillText(`${a.verdict.title}: ${a.verdict.sub}`, 40, y0 + 120);
+    x.fillStyle = '#2ee6ff'; x.font = '700 18px "Chakra Petch", sans-serif'; x.fillText('PAKSWAP STUDIO', 40, y0 + 34);
+    x.fillStyle = '#eaf1fb'; x.font = '700 44px "Chakra Petch", sans-serif'; x.fillText(`${c.brand} ${c.model} · ${a.engine.name}`, 40, y0 + 86);
+    x.fillStyle = '#93a1b7'; x.font = '500 20px "Archivo", sans-serif'; x.fillText(`${a.verdict.title}: ${a.verdict.sub}`, 40, y0 + 120);
     const stats = [[`${fmt(m.hpNos)} hp`, 'Power'], [`${fmt(m.nm)} Nm`, 'Torque'], [`${fmt(m.t100, 1)} s`, '0-100 km/h'], [`${fmt(m.vmax)} km/h`, 'Top speed'], [`${fmt(m.weight)} kg`, 'Weight']];
-    stats.forEach(([v, k], i) => { const sx = 40 + i * 268; x.fillStyle = '#efe9e0'; x.font = '700 30px "Chakra Petch", sans-serif'; x.fillText(v, sx, y0 + 166); x.fillStyle = '#a69d90'; x.font = '600 14px "Chakra Petch", sans-serif'; x.fillText(k.toUpperCase(), sx, y0 + 184); });
+    stats.forEach(([v, k], i) => { const sx = 40 + i * 268; x.fillStyle = '#eaf1fb'; x.font = '700 30px "Chakra Petch", sans-serif'; x.fillText(v, sx, y0 + 166); x.fillStyle = '#93a1b7'; x.font = '600 14px "Chakra Petch", sans-serif'; x.fillText(k.toUpperCase(), sx, y0 + 184); });
     const url = cv.toDataURL('image/png');
     const dl = typeof __ARTIFACT__ !== 'undefined' && __ARTIFACT__ ? '' : `<div class="sl-row"><a class="btn primary" href="${url}" download="pakswap-${c.id}.png">Download image</a></div>`;
     openModal('Build card', `<img class="photo" src="${url}" alt="Build card for ${esc(c.brand)} ${esc(c.model)} with ${esc(a.engine.name)}"><p class="hint">Right-click or long-press the image to save or share it.</p>${dl}`);
@@ -1038,13 +1102,27 @@ function openPhoto() {
 
 function openSettings() {
   const q = studio ? studio.quality : 'off';
+  const tierName = (t) => t[0].toUpperCase() + t.slice(1);
+  const Q = [['auto', 'Auto', 'Adapts to this computer'], ['high', 'High', 'Reflections, bloom, sharpest'], ['medium', 'Medium', 'Balanced'], ['low', 'Low', 'Fastest on old hardware']];
+  const G = [['auto', 'Auto', 'Blur on, unless graphics are low'], ['on', 'Glass', 'Always blur behind panels'], ['off', 'Solid', 'No blur, lightest on the GPU']];
+  const gl = store.get('glass', 'auto');
   openModal('Settings', `
-    <div class="group"><div class="label"><span>Graphics quality</span></div><div class="opts">${['high', 'medium', 'low'].map((k) => `<button type="button" class="opt" data-q="${k}" aria-pressed="${q === k}">${k[0].toUpperCase() + k.slice(1)}<small>${k === 'high' ? 'Sharpest, bloom at night' : k === 'medium' ? 'Balanced' : 'Fast on older phones'}</small></button>`).join('')}</div></div>
+    <div class="group"><div class="label"><span>Graphics quality</span><em id="tierNow">${studio ? `Running at ${tierName(studio.tier)}` : ''}</em></div><div class="opts">${Q.map(([k, l, d]) => `<button type="button" class="opt" data-q="${k}" aria-pressed="${q === k}">${l}<small>${d}</small></button>`).join('')}</div></div>
+    <div class="group"><div class="label"><span>Interface</span></div><div class="opts">${G.map(([k, l, d]) => `<button type="button" class="opt" data-glass="${k}" aria-pressed="${gl === k}">${l}<small>${d}</small></button>`).join('')}</div></div>
     <div class="group"><div class="label"><span>Keyboard</span></div><p class="hint">Space: rev · E: start or stop · X: X-ray · 1 to 5: camera views · Esc: close</p></div>
     <div class="group"><div class="label"><span>Drive mode</span></div><p class="hint">Press Drive in the top bar to take this build into the open world. W A S D or arrows: drive · Space: handbrake · N: nitrous · H: horn · C: camera · R: reset to the road · Esc: menu and map · F1: all controls. Gamepads and touch screens work too.</p></div>
     <div class="group"><div class="label"><span>About the numbers</span></div><p class="hint">Factory figures come from published specs for the Pakistani market. Performance is simulated from power curves, gearing, weight, grip and drag, so treat it as a strong estimate, not a guarantee.</p></div>`, () => {
     const body = $('#modalBody');
-    const h = (ev) => { const b = ev.target.closest('[data-q]'); if (!b || !studio) return; studio.setQuality(b.dataset.q); store.set('quality', b.dataset.q); body.querySelectorAll('[data-q]').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); };
+    const h = (ev) => {
+      const b = ev.target.closest('[data-q]');
+      if (b && studio) {
+        studio.setQuality(b.dataset.q); store.set('quality', b.dataset.q); applyGlass();
+        body.querySelectorAll('[data-q]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        $('#tierNow').textContent = `Running at ${tierName(studio.tier)}`;
+      }
+      const g = ev.target.closest('[data-glass]');
+      if (g) { store.set('glass', g.dataset.glass); applyGlass(); body.querySelectorAll('[data-glass]').forEach((x) => x.setAttribute('aria-pressed', String(x === g))); }
+    };
     body.addEventListener('click', h);
     return () => body.removeEventListener('click', h);
   });
@@ -1062,7 +1140,7 @@ async function boot() {
   updateAudioEngine();
   $('#vol').value = store.get('vol', 0.75);
   const ok = await init3D();
-  if (ok) { buildModel(true); loadCustomFor(S.carId); }
+  if (ok) { updateInsets(); buildModel(true); loadCustomFor(S.carId); }
   const stage = $('#stage');
   stage.addEventListener('dragover', (ev) => { if (ev.dataTransfer && [...ev.dataTransfer.types].includes('Files')) { ev.preventDefault(); stage.classList.add('drop'); } });
   stage.addEventListener('dragleave', () => stage.classList.remove('drop'));
@@ -1070,7 +1148,7 @@ async function boot() {
   $('#loading').classList.add('hide');
   S.ready = true;
   window.__pakswapReady = true;
-  window.PakSwap = { state: S, audio, rev, version: '1.2', drive: () => drive, openDrive };
+  window.PakSwap = { state: S, audio, rev, version: '1.2', drive: () => drive, openDrive, studio: () => studio, model: () => model, selectCar, setCfg };
   // frames stop in a background tab, so pause the engine sound instead of letting it hang
   document.addEventListener('visibilitychange', () => {
     if (!audio.ctx) return;

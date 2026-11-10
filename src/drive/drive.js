@@ -43,6 +43,8 @@ export class DriveMode {
     this.body = { roll: 0, rollV: 0, pitch: 0, pitchV: 0 };
     this.lights = 1;
     this.t = 0;
+    // scratch objects reused every frame, so driving creates no garbage
+    this.tmp = { size: new THREE.Vector2(), target: new THREE.Vector3(), want: new THREE.Vector3(), local: new THREE.Vector3(), fwd: new THREE.Vector3(), v3: new THREE.Vector3(), hw: [0, 0, 0, 0] };
   }
 
   // ---------------------------------------------------------------- enter / exit
@@ -60,7 +62,7 @@ export class DriveMode {
     this.hud.el.hidden = false;
     this.hud.loading(true);
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    const quality = studio.quality;
+    const quality = studio.tier;
     try {
       if (!this.world) this.world = buildOpenWorld({ quality });
       if (!this.view || this.viewQuality !== quality) {
@@ -88,7 +90,8 @@ export class DriveMode {
     // renderer: drive look
     const r = studio.renderer;
     this.savedR = { exposure: r.toneMappingExposure, shadows: r.shadowMap.enabled };
-    if (!this.camera) this.camera = new THREE.PerspectiveCamera(60, 1, 0.25, 12000);
+    if (!this.camera) { this.camera = new THREE.PerspectiveCamera(60, 1, 0.25, 12000); this.camera.layers.enable(1); }
+    r.shadowMap.autoUpdate = true;
     this.applyQuality();
     this.setTime(this.set.time, true);
     this.acc = 0;
@@ -106,6 +109,7 @@ export class DriveMode {
     const okAudio = await ctx.ensureAudio();
     const rev = ctx.rev;
     if (okAudio) {
+      ctx.audio.setSpace('open');
       ctx.syncAudio();
       if (!rev.running) { if (!rev.on) rev.start(); this.phys.engineOn = false; this.hud.message('Starting the engine', '', 2); }
       else { this.phys.engineOn = true; this.phys.rpm = rev.rpm; }
@@ -129,7 +133,7 @@ export class DriveMode {
     if (model.body) model.body.rotation.set(0, 0, 0);
     if (model.custom) model.custom.root.rotation.set(0, 0, 0);
     for (let i = 0; i < 4; i++) model.setWheelPose?.(i, 0, 0);
-    (model.beams || []).forEach((b, i) => { const s = this.saved.beams[i]; if (s) { b.intensity = s.i; b.distance = s.d; b.angle = s.a; b.decay = s.decay; } });
+    (model.beams || []).forEach((b, i) => { const s = this.saved.beams[i]; if (s) { b.intensity = s.i; b.visible = s.i > 0; b.distance = s.d; b.angle = s.a; b.decay = s.decay; } });
     model.setNight(this.saved.night);
     (model.taillights || []).forEach((t, i) => { t.material.emissiveIntensity = this.saved.tail[i] ?? t.material.emissiveIntensity; });
     model.setXray(this.saved.xray);
@@ -137,11 +141,13 @@ export class DriveMode {
     const r = studio.renderer;
     r.toneMappingExposure = this.savedR.exposure;
     studio.setNight(studio.night);
-    studio.setQuality(studio.quality);
+    r.shadowMap.autoUpdate = false;
+    studio.applyTier();
     // hand the revs back to the free-revving engine model
     const rev = ctx.rev;
     if (this.phys && this.phys.engineOn) { rev.rpm = Math.max(rev.idle || 0, Math.min(this.phys.rpm, (rev.redline || 6000) * 0.8)); rev.throttle = 0; }
     ctx.audio.setState({ slip: 0, speed: 0, surf: 0, rough: 0, scrape: 0, horn: 0, scrub: 0 });
+    if (ctx.audio.ready) ctx.audio.setSpace('garage');
     ctx.store.set('drive', this.set);
     ctx.onExit?.();
   }
@@ -170,12 +176,12 @@ export class DriveMode {
   }
 
   applyQuality() {
-    const studio = this.ctx.studio, r = studio.renderer, q = studio.quality;
+    const studio = this.ctx.studio, r = studio.renderer, q = studio.tier;
     r.shadowMap.enabled = q !== 'low';
     this.sky.sun.castShadow = q !== 'low';
     const n = q === 'high' ? 2048 : 1024;
     if (this.sky.sun.shadow.mapSize.x !== n) { this.sky.sun.shadow.mapSize.set(n, n); this.sky.sun.shadow.map?.dispose(); this.sky.sun.shadow.map = null; }
-    if (this.composer) { this.composer.dispose?.(); this.composer = null; }
+    if (this.composer) { this.composer.dispose(); this.bloom?.dispose?.(); this.composer = null; this.bloom = null; }
     if (q === 'high') {
       const size = r.getSize(new THREE.Vector2());
       const pr = r.getPixelRatio();
@@ -334,7 +340,7 @@ export class DriveMode {
   applyLights() {
     const m = this.ctx.model;
     const on = this.lights > 0;
-    for (const b of m.beams || []) { b.intensity = on ? (this.lights === 2 ? 320 : 150) : 0; b.distance = this.lights === 2 ? 160 : 80; b.angle = this.lights === 2 ? 0.36 : 0.5; b.penumbra = 0.55; b.decay = 1.25; }
+    for (const b of m.beams || []) { b.intensity = on ? (this.lights === 2 ? 320 : 150) : 0; b.visible = on; b.distance = this.lights === 2 ? 160 : 80; b.angle = this.lights === 2 ? 0.36 : 0.5; b.penumbra = 0.55; b.decay = 1.25; }
     for (const h of m.headlights || []) h.material.emissiveIntensity = on ? 2.6 : 0.35;
     this.tailBase = on ? 1.4 : 0.3;
   }
@@ -345,7 +351,7 @@ export class DriveMode {
     this.t += dt;
     const ctx = this.ctx, p = this.phys, studio = ctx.studio, r = studio.renderer;
     // keep the camera and post chain in step with the canvas size
-    const size = r.getSize(this.tmpV2 || (this.tmpV2 = new THREE.Vector2()));
+    const size = r.getSize(this.tmp.size);
     const asp = size.x / Math.max(1, size.y);
     if (Math.abs(this.camera.aspect - asp) > 1e-3) { this.camera.aspect = asp; this.camera.updateProjectionMatrix(); }
     if (this.composer && (this.compSize[0] !== size.x || this.compSize[1] !== size.y || this.compSize[2] !== r.getPixelRatio())) { this.composer.setPixelRatio?.(r.getPixelRatio()); this.composer.setSize(size.x, size.y); this.compSize = [size.x, size.y, r.getPixelRatio()]; }
@@ -360,10 +366,12 @@ export class DriveMode {
       if (rev.running) { p.engineOn = true; p.rpm = rev.rpm; p.engW = (rev.rpm * Math.PI) / 30; }
       else p.rpm = rev.rpm;
     }
-    for (const e of rev.drain()) {
+    const revEv = rev.drain();
+    for (let i = 0; i < revEv.length; i++) {
+      const e = revEv[i];
       if (e.type === 'cough') ctx.audio.trigger('cough', 1);
-      else if (['click', 'catch', 'ready', 'poweroff', 'shudder'].includes(e.type)) ctx.audio.trigger(e.type, e.v);
       else if (e.type === 'pop') ctx.audio.trigger('pop', e.v);
+      else if (e.type === 'click' || e.type === 'catch' || e.type === 'ready' || e.type === 'poweroff' || e.type === 'shudder') ctx.audio.trigger(e.type, e.v);
     }
     // ---------------- physics at 240 Hz
     p.input.throttle = inp.throttle; p.input.brake = inp.brake; p.input.steer = inp.steer; p.input.handbrake = inp.handbrake; p.input.nitrous = inp.nitrous;
@@ -374,12 +382,16 @@ export class DriveMode {
       this.prev.x = p.x; this.prev.y = p.y; this.prev.psi = p.psi;
       p.step(DT, this.wp);
       this.wp.update(DT);
-      for (const e of p.events.splice(0)) {
+      const pe = p.events;
+      for (let i = 0; i < pe.length; i++) {
+        const e = pe[i];
         if (e.type === 'shift') { ctx.audio.trigger('shift'); if (e.up && this.turbo && e.boost > 0.45) ctx.audio.trigger('bov', Math.min(1, e.boost)); }
         else if (e.type === 'limiter') { if (rev.pops && Math.random() < 0.5) { ctx.audio.trigger('pop', 0.8); this.flameT = 0.06; } }
         else if (e.type === 'impact') impact = Math.max(impact, e.dv);
       }
-      for (const e of this.wp.drain()) if (e.type === 'cone') { cones++; ctx.audio.trigger('cone', e.v); }
+      pe.length = 0;
+      const we = this.wp.drain();
+      for (let i = 0; i < we.length; i++) if (we[i].type === 'cone') { cones++; ctx.audio.trigger('cone', we[i].v); }
       this.acc -= DT; steps++;
     }
     if (steps >= 16) this.acc = 0;
@@ -402,7 +414,7 @@ export class DriveMode {
     // ---------------- camera, world streaming, lights
     this.updateCamera(dt, x, y, psi, inp);
     this.sky.follow(this.camera.position.x, this.camera.position.z, dt);
-    this.view.update(dt, x, y, this.camera.position.x, -this.camera.position.z);
+    this.view.update(dt, x, y, this.camera.position.x, -this.camera.position.z, this.camera);
     if (this.view.park.cones && this.wp.conesDirty) { this.view.park.syncCones(this.wp.cones); this.wp.conesDirty = false; }
     this.fx.update(dt, this.camera);
     // ---------------- HUD
@@ -462,8 +474,8 @@ export class DriveMode {
     const p = this.phys, m = this.ctx.model, W = this.wp;
     const cp = Math.cos(psi), sp = Math.sin(psi);
     // ground under each wheel (raised kerbs and sidewalks included)
-    const hw = [];
-    for (const w of p.wheels) { const wx = x + w.px * cp - w.py * sp, wy = y + w.px * sp + w.py * cp; hw.push(W.groundAt(wx, wy)); }
+    const hw = this.tmp.hw;
+    for (let i = 0; i < 4; i++) { const w = p.wheels[i]; hw[i] = W.groundAt(x + w.px * cp - w.py * sp, y + w.px * sp + w.py * cp); }
     const hF = (hw[0] + hw[1]) / 2, hR = (hw[2] + hw[3]) / 2, hL = (hw[0] + hw[2]) / 2, hRt = (hw[1] + hw[3]) / 2;
     const pitchT = Math.atan2(hF - hR, p.WB), rollT = Math.atan2(hL - hRt, p.track);
     // model origin sits between the axles
@@ -503,7 +515,7 @@ export class DriveMode {
 
   updateEffects(dt, psi) {
     const p = this.phys, fx = this.fx, W = this.wp;
-    const q = this.ctx.studio.quality === 'low' ? 0.45 : this.ctx.studio.quality === 'medium' ? 0.75 : 1;
+    const q = this.ctx.studio.tier === 'low' ? 0.45 : this.ctx.studio.tier === 'medium' ? 0.75 : 1;
     const cp = Math.cos(p.psi), sp = Math.sin(p.psi);
     const vx = p.u * cp - p.v * sp, vy = p.u * sp + p.v * cp;
     const tyreHalf = (this.build.a.veh.tyreW / 1000) * 0.45;
@@ -536,7 +548,7 @@ export class DriveMode {
     const m = this.ctx.model;
     if (m.flames && m.flames.length && p.engineOn) {
       const fl = m.flames[0];
-      const wp = fl.getWorldPosition(this.tmpV3 || (this.tmpV3 = new THREE.Vector3()));
+      const wp = fl.getWorldPosition(this.tmp.v3);
       if (this.isDiesel && p.thrEff > 0.6 && p.rpm < p.redline * 0.85 && Math.random() < dt * 30) fx.emit(wp.x, wp.y, wp.z, -vx * 0.1, 0.4, vy * 0.1, 'diesel', 0.8 + p.thrEff * 0.4);
       else if (!this.isEV && this.t < 20 && Math.random() < dt * 4) fx.emit(wp.x, wp.y, wp.z, 0, 0.2, 0, 'exhaust', 0.8);
     }
@@ -546,7 +558,8 @@ export class DriveMode {
   updateDrift(dt) {
     const p = this.phys, D = this.D;
     const beta = p.beta, deg = Math.abs(beta) * 57.3;
-    const tarmac = p.wheels.filter((w) => TARMAC.has(w.kind)).length >= 2;
+    let onTar = 0; for (let i = 0; i < 4; i++) if (TARMAC.has(p.wheels[i].kind)) onTar++;
+    const tarmac = onTar >= 2;
     const drifting = p.speed > 6 && p.u > 2 && deg > 10 && tarmac && p.gear >= 0;
     D.angle = (beta * 57.3);
     if (drifting) {
@@ -611,7 +624,8 @@ export class DriveMode {
         if (L.sector === 1 && s > (2 * len) / 3) L.sector = 2;
         if (L.trace.length === 0 || s - L.trace[L.trace.length - 1][0] > 8) L.trace.push([s, this.t - L.t0]);
         // track limits: all four wheels off the tarmac and kerbs
-        if (p.wheels.every((w) => !TARMAC.has(w.kind)) && this.onCircuit) { if (!L.invalid) this.hud.message('Track limits: lap invalid', 'bad', 1.6); L.invalid = true; }
+        let offAll = true; for (let i = 0; i < 4; i++) if (TARMAC.has(p.wheels[i].kind)) { offAll = false; break; }
+        if (offAll && this.onCircuit) { if (!L.invalid) this.hud.message('Track limits: lap invalid', 'bad', 1.6); L.invalid = true; }
         // wrong way
         const t = W.circuit;
         const dirOk = Math.cos(p.psi) * t.tx[nr.i] + Math.sin(p.psi) * t.ty[nr.i];
@@ -637,7 +651,8 @@ export class DriveMode {
   // water, out of bounds: put the car back on the road
   updateSafety(dt) {
     const p = this.phys;
-    const water = p.wheels.filter((w) => w.kind === 'water').length >= 3;
+    let wet = 0, tar = 0; for (let i = 0; i < 4; i++) { const k = p.wheels[i].kind; if (k === 'water') wet++; else if (TARMAC.has(k)) tar++; }
+    const water = wet >= 3;
     if (water) {
       this.wetT = (this.wetT || 0) + dt;
       if (this.wetT > 1.6) { this.hud.message('Into the lake! Back on the road', 'bad', 2); this.wetT = 0; p.reset(this.safe.x, this.safe.y, this.safe.psi); this.prev = { x: p.x, y: p.y, psi: p.psi }; this.camSnap = true; }
@@ -645,7 +660,7 @@ export class DriveMode {
     }
     this.wetT = 0;
     this.safeT = (this.safeT || 0) + dt;
-    if (this.safeT > 1 && p.wheels.every((w) => TARMAC.has(w.kind)) && p.speed < 45 && Math.abs(p.beta) < 0.3) { this.safeT = 0; this.safe = { x: p.x, y: p.y, psi: p.psi }; }
+    if (this.safeT > 1 && tar === 4 && p.speed < 45 && Math.abs(p.beta) < 0.3) { this.safeT = 0; this.safe.x = p.x; this.safe.y = p.y; this.safe.psi = p.psi; }
   }
 
   // ---------------------------------------------------------------- cameras
@@ -668,7 +683,7 @@ export class DriveMode {
     const vx = p.u * Math.cos(p.psi) - p.v * Math.sin(p.psi), vy = p.u * Math.sin(p.psi) + p.v * Math.cos(p.psi);
     const spd = Math.hypot(vx, vy);
     let fov = 58;
-    const target = new THREE.Vector3(x, base + Hc * 0.45, -y);
+    const target = this.tmp.target.set(x, base + Hc * 0.45, -y);
     if (mode === 'chase' || mode === 'far') {
       // camera yaw follows a blend of heading and travel direction, so drifts show the car's angle
       let want = psi;
@@ -679,7 +694,7 @@ export class DriveMode {
       const yaw = c.yaw + c.lookYaw + back;
       const dist = (mode === 'far' ? 8 + L * 1.1 : 3.9 + L * 0.82) + clamp(spd / 30, 0, 1) * 0.8;
       const hgt = (mode === 'far' ? 2.8 + Hc * 0.7 : 1.15 + Hc * 0.62) + c.lookPitch * dist * 0.6;
-      const want3 = new THREE.Vector3(x - Math.cos(yaw) * dist, base + hgt, -(y - Math.sin(yaw) * dist));
+      const want3 = this.tmp.want.set(x - Math.cos(yaw) * dist, base + hgt, -(y - Math.sin(yaw) * dist));
       const k = this.camSnap ? 1 : Math.min(1, dt * 11);
       c.pos.lerp(want3, k);
       // never below the hillside
@@ -693,16 +708,16 @@ export class DriveMode {
       const g = this.geo;
       const lx = mode === 'hood' ? g.xF - 0.35 : g.xNose + 0.05;
       const ly = mode === 'hood' ? (g.zTop ? g.zTop(g.xF - 0.35) : 1.0) + 0.42 : 0.55;
-      const local = new THREE.Vector3(lx, ly, 0);
+      const local = this.tmp.local.set(lx, ly, 0);
       m.root.updateMatrixWorld();
       const wpos = local.applyMatrix4(m.root.matrixWorld);
       cam.position.copy(wpos);
       const yaw = psi + c.lookYaw + (inp.lookBack ? Math.PI : 0);
-      const fwd = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+      const fwd = this.tmp.fwd.set(Math.cos(yaw), 0, -Math.sin(yaw));
       const pitch = (this.gp ? this.gp.pitch : 0) + this.body.pitch - 0.035 - c.lookPitch * 0.5;
       fwd.y = Math.tan(pitch);
-      cam.up.set(Math.sin(this.gp ? this.gp.roll + this.body.roll * 0.5 : 0) * cpx * 0, 1, 0);
-      cam.lookAt(wpos.clone().add(fwd));
+      cam.up.set(0, 1, 0);
+      cam.lookAt(fwd.add(wpos));
       fov = mode === 'hood' ? 62 + clamp(p.kmh / 250, 0, 1) * 10 : 68;
       c.pos.copy(cam.position);
     } else if (mode === 'tv') {
@@ -718,7 +733,7 @@ export class DriveMode {
       c.pos.copy(cam.position);
     } else if (mode === 'drone') {
       const yaw = c.yaw += wrap(psi - c.yaw) * Math.min(1, dt * 1.5);
-      const want3 = new THREE.Vector3(x - Math.cos(yaw) * 9, base + 26, -(y - Math.sin(yaw) * 9));
+      const want3 = this.tmp.want.set(x - Math.cos(yaw) * 9, base + 26, -(y - Math.sin(yaw) * 9));
       c.pos.lerp(want3, this.camSnap ? 1 : Math.min(1, dt * 4));
       cam.position.copy(c.pos);
       cam.lookAt(target);
@@ -742,7 +757,7 @@ export class DriveMode {
     c.fov += (fov - c.fov) * Math.min(1, dt * (this.camSnap ? 100 : 4));
     if (Math.abs(cam.fov - c.fov) > 0.01) { cam.fov = c.fov; cam.updateProjectionMatrix(); }
     // shake: impacts, kerbs, very high speed
-    const kerb = p.wheels.some((w) => w.kind === 'kerb') ? 0.012 : 0;
+    let kerb = 0; for (let i = 0; i < 4; i++) if (p.wheels[i].kind === 'kerb') { kerb = 0.012; break; }
     const sh = c.shake + kerb + (p.kmh > 170 ? (p.kmh - 170) * 0.00006 : 0);
     if (sh > 0.0005 && mode !== 'tv') { cam.position.x += (Math.random() - 0.5) * sh; cam.position.y += (Math.random() - 0.5) * sh; cam.position.z += (Math.random() - 0.5) * sh; }
     c.shake *= Math.exp(-dt * 5);

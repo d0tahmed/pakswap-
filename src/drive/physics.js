@@ -24,6 +24,18 @@ const TYRE = {
 const LSD = { open: { pre: 0, bias: 0, c: 0 }, helical: { pre: 25, bias: 0.4, c: 260 }, clutch: { pre: 90, bias: 0.65, c: 420 } };
 const SUSP = { stock: 0.93, springs: 0.97, coilovers: 1.0, air: 0.96, lift: 0.88 };
 const ROLL = { stock: 1, springs: 0.8, coilovers: 0.62, air: 0.85, lift: 1.25 };
+// Suspension set-ups: body roll per g of cornering (degrees), dive or squat per g (degrees),
+// damping ratio and the share of roll stiffness carried by the front axle. Lowering springs on
+// factory dampers are stiffer but under-damped; coilovers are stiff and well controlled.
+const SETUP = {
+  stock: { roll: 4.6, pitch: 2.0, zeta: 0.36, front: 0.58 },
+  springs: { roll: 3.6, pitch: 1.6, zeta: 0.27, front: 0.58 },
+  coilovers: { roll: 2.6, pitch: 1.1, zeta: 0.62, front: 0.56 },
+  air: { roll: 3.9, pitch: 1.8, zeta: 0.4, front: 0.58 },
+  lift: { roll: 5.8, pitch: 2.5, zeta: 0.3, front: 0.6 },
+};
+// Lift of the bare body shape (front, rear) as a coefficient on frontal area; positive = lift.
+const BODY_LIFT = { kei: [0.1, 0.14], tallboy: [0.11, 0.15], hatch: [0.09, 0.14], hothatch: [0.07, 0.11], sedan: [0.09, 0.12], fastback: [0.07, 0.1], suv: [0.1, 0.13], bigsuv: [0.11, 0.14], jeep: [0.12, 0.14], pickup: [0.11, 0.16], van: [0.1, 0.12] };
 
 export const WHEEL = { FL: 0, FR: 1, RL: 2, RR: 3 };
 
@@ -51,8 +63,36 @@ export class CarPhysics {
     this.kp = ty.kp;
     this.tanAp = Math.tan((ty.ap * Math.PI) / 180);
     this.muX = veh.mu;
-    this.muY = veh.muLat * (SUSP[cfg.suspension || 'stock'] || 0.93) * (cfg.widebody ? 1.02 : 1) * (cfg.spoiler === 'wing' ? 1.02 : 1);
+    this.muY = veh.muLat * (SUSP[cfg.suspension || 'stock'] || 0.93) * (cfg.widebody ? 1.02 : 1);
     this.rollK = ROLL[cfg.suspension || 'stock'] || 1;
+    // ---- sprung mass on its springs: roll and pitch as damped second-order systems. Load moves
+    // between the tyres through the springs and dampers (plus a part straight through the
+    // suspension links), so how quickly and how far the weight shifts depends on the set-up.
+    const su = SETUP[cfg.suspension || 'stock'] || SETUP.stock;
+    const tall = clamp(this.h / 0.52, 0.85, 1.5); // tall vehicles lean more on the same springs
+    this.hrc = clamp(this.h * 0.24, 0.08, 0.2); // roll-centre height
+    this.hr = this.h - this.hrc;
+    this.Kroll = (this.m * G * this.hr) / ((su.roll * tall * Math.PI) / 180);
+    this.Ix = this.m * Math.pow(0.34 * W, 2) + this.m * 0.06;
+    this.Croll = 2 * su.zeta * Math.sqrt(this.Kroll * this.Ix);
+    this.Kpitch = (this.m * G * this.h) / ((su.pitch * tall * Math.PI) / 180);
+    this.Iy = this.m * Math.pow(0.27 * L, 2);
+    this.Cpitch = 2 * (su.zeta + 0.08) * Math.sqrt(this.Kpitch * this.Iy);
+    this.rollFront = su.front + (veh.drive === 'RWD' ? -0.03 : 0);
+    // ---- aerodynamic lift and downforce (N per (m/s)^2), front and rear axle; positive presses
+    // the car down. A bare body lifts a little at speed; lips, diffusers and wings fight that.
+    const bl = BODY_LIFT[car.body] || BODY_LIFT.sedan;
+    const ride = (veh.ride || 0) / 1000;
+    let clF = -bl[0], clR = -bl[1];
+    if (cfg.lip) clF += 0.06;
+    if (cfg.skirts) { clF += 0.01; clR += 0.01; }
+    if (cfg.diffuser) clR += 0.06;
+    clR += { none: 0, lip: 0.03, ducktail: 0.07, roof: 0.04, wing: 0.22 }[cfg.spoiler || 'none'] || 0;
+    if (cfg.spoiler === 'wing') clF -= 0.02; // a big rear wing levers the nose up slightly
+    if (cfg.roofAcc === 'box' || cfg.roofAcc === 'luggage' || cfg.roofAcc === 'rack') { clF -= 0.015; clR -= 0.02; }
+    clF -= ride * 0.5; clR -= ride * 0.4; // lower = less air under the car
+    this.aeroF = 0.5 * RHO * veh.A * clF;
+    this.aeroR = 0.5 * RHO * veh.A * clR;
     this.drive = veh.drive;
     this.driven = this.drive === 'FWD' ? [1, 1, 0, 0] : this.drive === 'RWD' ? [0, 0, 1, 1] : [1, 1, 1, 1];
     this.frontSplit = this.drive === 'AWD' ? (['bigsuv', 'jeep', 'pickup'].includes(car.body) ? 0.5 : 0.38) : 0;
@@ -98,6 +138,11 @@ export class CarPhysics {
     this.engineOn = opts.engineOn ?? true;
     this.input = { throttle: 0, brake: 0, steer: 0, handbrake: 0, nitrous: false };
     this.events = [];
+    // scratch storage reused by every step: the 240 Hz loop must not create garbage
+    this.loads = [0, 0, 0, 0];
+    this.tq = [0, 0, 0, 0];
+    this.grad = [0, 0];
+    this.box = { cx: 0, cy: 0, cp: 1, sp: 0, hl: L / 2, hw: this.W / 2, pts: [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]] };
     this.reset(0, 0, 0);
   }
 
@@ -117,6 +162,7 @@ export class CarPhysics {
     this.steerNow = 0; this.revHold = 0; this.hbTimer = 0; this.drifting = 0; this.shiftCool = 0;
     this.tcsF = 1; this.tcsActive = false; this.absActive = false; this.thrEff = 0; this.brkEff = 0;
     this.scrapeV = 0; this.contacts = []; this.maxSlip = 0;
+    this.roll = 0; this.rollV = 0; this.pitch = 0; this.pitchV = 0;
     this.time = 0;
     this.cvtRatio = this.kind === 'cvt' ? this.gb.range[0] : 1;
   }
@@ -228,23 +274,34 @@ export class CarPhysics {
     const rate = 2.8 * dt; // rad per step limit
     this.steerNow += clamp(target - this.steerNow, -rate, rate);
     const delta = this.steerNow;
-    // ---------------- loads with load transfer (filtered accelerations)
+    // ---------------- loads: the body rolls and pitches on its springs, and the springs and
+    // dampers pass the weight on to the tyres
     const ax = this.axF, ay = this.ayF;
     const WB = this.WB, h = this.h, t = this.track;
-    const FzF = (m * G * this.b) / WB - (m * ax * h) / WB;
-    const FzR = (m * G * this.a) / WB + (m * ax * h) / WB;
-    const dWf = (0.6 * m * ay * h) / t, dWr = (0.4 * m * ay * h) / t;
+    this.rollV += ((m * this.hr * ay - this.Kroll * this.roll - this.Croll * this.rollV) / this.Ix) * dt;
+    this.roll += this.rollV * dt;
+    this.pitchV += ((m * h * ax - this.Kpitch * this.pitch - this.Cpitch * this.pitchV) / this.Iy) * dt;
+    this.pitch += this.pitchV * dt;
+    const wfS = this.b / WB; // static front weight share
+    const Mroll = this.Kroll * this.roll + this.Croll * this.rollV, Mgeo = m * ay * this.hrc;
+    const Mpitch = this.Kpitch * this.pitch + this.Cpitch * this.pitchV;
+    const v2 = u * u;
+    const FzF = m * G * wfS - Mpitch / WB + this.aeroF * v2;
+    const FzR = m * G * (1 - wfS) + Mpitch / WB + this.aeroR * v2;
+    const dWf = (this.rollFront * Mroll + wfS * Mgeo) / t, dWr = ((1 - this.rollFront) * Mroll + (1 - wfS) * Mgeo) / t;
     // slope: gravity pulls along the hill and the tyres carry a little less weight
     let gSx = 0, gSy = 0, cosSl = 1;
     if (world && world.gradAt) {
-      const gr = world.gradAt(this.x, this.y);
+      const gr = world.gradAt(this.x, this.y, this.grad);
       cosSl = 1 / Math.sqrt(1 + gr[0] * gr[0] + gr[1] * gr[1]);
       const c0 = Math.cos(this.psi), s0 = Math.sin(this.psi);
       gSx = -m * G * (gr[0] * c0 + gr[1] * s0) * cosSl;
       gSy = -m * G * (-gr[0] * s0 + gr[1] * c0) * cosSl;
     }
     this.slopeF = gSx;
-    const loads = [FzF / 2 - dWf, FzF / 2 + dWf, FzR / 2 - dWr, FzR / 2 + dWr].map((x) => Math.max(0, x * cosSl));
+    const loads = this.loads;
+    loads[0] = Math.max(0, (FzF / 2 - dWf) * cosSl); loads[1] = Math.max(0, (FzF / 2 + dWf) * cosSl);
+    loads[2] = Math.max(0, (FzR / 2 - dWr) * cosSl); loads[3] = Math.max(0, (FzR / 2 + dWr) * cosSl);
     // ---------------- drivetrain
     let ratio = this.gearRatio();
     if (this.shiftT > 0) this.shiftT -= dt;
@@ -262,7 +319,7 @@ export class CarPhysics {
     const wAx = this.drivenOmega();
     let driveT = 0; // total torque delivered to the driven wheels
     let coupledI = 0; // engine inertia reflected to each driven wheel when the clutch is locked
-    const nDriven = this.driven.reduce((s, x) => s + x, 0);
+    const nDriven = this.driven[0] + this.driven[1] + this.driven[2] + this.driven[3];
     if (!this.engineOn) {
       driveT = 0; this.clutchLocked = false; this.boost *= Math.exp(-dt * 3);
     } else if (this.ev) {
@@ -321,7 +378,7 @@ export class CarPhysics {
       if (!this.manual && this.kind !== 'cvt' && this.gear > 0 && !shifting) {
         const n = this.ratios.length;
         const up = this.redline * (0.6 + 0.35 * thr);
-        const wheelSlip = this.wheels.some((w) => this.driven[w.i] && w.kappa > 0.35);
+        let wheelSlip = false; for (let i = 0; i < 4; i++) if (this.driven[i] && this.wheels[i].kappa > 0.35) { wheelSlip = true; break; }
         if (this.shiftCool > 0) this.shiftCool -= dt;
         if (this.gear < n && this.rpm > up && !(wheelSlip && Math.abs(u) < 6)) { this.startShift(this.gear + 1); this.shiftCool = 1.4; }
         else if (this.gear > 1 && this.shiftCool <= 0 && !wheelSlip) {
@@ -336,29 +393,18 @@ export class CarPhysics {
     const bMax = this.driftMax;
     if (this.assist > 0 && driveT * Math.sign(ratio || 1) > 0) driveT *= 1 - this.assist * 0.6 * smooth(bMax, bMax * 1.4, Math.abs(betaNow));
     // differentials: split driveT to the driven wheels
-    const tq = [0, 0, 0, 0];
-    const lsd = this.lsd;
-    const split = (iL, iR, T) => {
-      const wl = this.wheels[iL].w, wr = this.wheels[iR].w;
-      const dw = wl - wr;
-      const Ieff = this.Iw + coupledI;
-      let Tc = 0;
-      if (lsd.c > 0) {
-        const lim = Math.min(lsd.pre + lsd.bias * Math.abs(T), (Math.abs(dw) * Ieff) / dt * 0.9);
-        Tc = clamp(lsd.c * dw, -lim, lim);
-      }
-      tq[iL] += T / 2 - Tc / 2; tq[iR] += T / 2 + Tc / 2;
-    };
-    if (this.drive === 'FWD') split(0, 1, driveT);
-    else if (this.drive === 'RWD') split(2, 3, driveT);
+    const tq = this.tq;
+    tq[0] = 0; tq[1] = 0; tq[2] = 0; tq[3] = 0;
+    if (this.drive === 'FWD') this.splitAxle(0, 1, driveT, coupledI, dt);
+    else if (this.drive === 'RWD') this.splitAxle(2, 3, driveT, coupledI, dt);
     else {
       // centre coupling moves torque towards the slower axle
       const wf = (this.wheels[0].w + this.wheels[1].w) / 2, wr = (this.wheels[2].w + this.wheels[3].w) / 2;
       const dw = wf - wr;
       const lim = Math.min(60 + 0.5 * Math.abs(driveT), (Math.abs(dw) * (this.Iw * 2)) / dt * 0.9);
       const Tc = clamp(300 * dw, -lim, lim);
-      split(0, 1, driveT * this.frontSplit - Tc);
-      split(2, 3, driveT * (1 - this.frontSplit) + Tc);
+      this.splitAxle(0, 1, driveT * this.frontSplit - Tc, coupledI, dt);
+      this.splitAxle(2, 3, driveT * (1 - this.frontSplit) + Tc, coupledI, dt);
     }
     // ---------------- tyres
     let Fx = 0, Fy = 0, Mz = 0;
@@ -496,14 +542,31 @@ export class CarPhysics {
     if (world) this.collide(world, dt);
   }
 
+  // Differential: split axle torque between two wheels; a limited-slip unit moves torque from
+  // the faster wheel to the slower one.
+  splitAxle(iL, iR, T, coupledI, dt) {
+    const lsd = this.lsd, tq = this.tq;
+    let Tc = 0;
+    if (lsd.c > 0) {
+      const dw = this.wheels[iL].w - this.wheels[iR].w;
+      const lim = Math.min(lsd.pre + lsd.bias * Math.abs(T), (Math.abs(dw) * (this.Iw + coupledI)) / dt * 0.9);
+      Tc = clamp(lsd.c * dw, -lim, lim);
+    }
+    tq[iL] += T / 2 - Tc / 2; tq[iR] += T / 2 + Tc / 2;
+  }
+
   // ---------------------------------------------------------------- collisions with the world
+  // The body outline as eight sample points (corners and edge mid-points). The same object is
+  // refilled on every call.
   corners() {
     const cp = Math.cos(this.psi), sp = Math.sin(this.psi);
     const cx = this.x - this.xCg * cp, cy = this.y - this.xCg * sp;
     const hl = this.L / 2, hw = this.W / 2;
-    const out = [];
-    for (const [lx, ly] of [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw], [hl, 0], [-hl, 0], [0, hw], [0, -hw]]) out.push([cx + lx * cp - ly * sp, cy + lx * sp + ly * cp]);
-    return { cx, cy, cp, sp, hl, hw, pts: out };
+    const b = this.box, P = b.pts;
+    b.cx = cx; b.cy = cy; b.cp = cp; b.sp = sp; b.hl = hl; b.hw = hw;
+    const set = (i, lx, ly) => { P[i][0] = cx + lx * cp - ly * sp; P[i][1] = cy + lx * sp + ly * cp; };
+    set(0, hl, hw); set(1, hl, -hw); set(2, -hl, -hw); set(3, -hl, hw); set(4, hl, 0); set(5, -hl, 0); set(6, 0, hw); set(7, 0, -hw);
+    return b;
   }
 
   // Apply an impulse at world point (px, py) along normal n.
@@ -541,7 +604,8 @@ export class CarPhysics {
   collide(world, dt) {
     const box = this.corners();
     const hits = world.collide(box, this);
-    for (const h of hits) {
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i];
       const dv = this.impulse(h.px, h.py, h.nx, h.ny, h.depth, h.restitution ?? 0.22, h.friction ?? 0.35, h.vx || 0, h.vy || 0);
       if (dv > 0.6) this.events.push({ type: 'impact', dv, x: h.px, y: h.py, nx: h.nx, ny: h.ny, dyn: h.dyn });
     }

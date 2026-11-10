@@ -1,7 +1,15 @@
 // Canvas charts and gauges, styled from CSS custom properties.
 import { torqueAt, K_HP } from '../sim/powertrain.js';
 
-function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#999'; }
+// Theme colours are read from the style sheet once and remembered: asking the browser for a
+// computed style on every gauge frame forces a style recalculation each time.
+const cssCache = new Map();
+function css(name) {
+  let v = cssCache.get(name);
+  if (v === undefined) { v = getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#999'; cssCache.set(name, v); }
+  return v;
+}
+export function resetChartColors() { cssCache.clear(); }
 
 export function prep(canvas) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -121,7 +129,7 @@ export function drawTacho(canvas, s) {
   if (!s.ev) { x.strokeStyle = css('--bad'); x.lineWidth = 6; x.beginPath(); x.arc(cx, cy, R, A(s.redline), a1); x.stroke(); }
   // live arc
   const frac = Math.max(0, Math.min(1, s.rpm / max));
-  const g = x.createLinearGradient(cx - R, 0, cx + R, 0); g.addColorStop(0, css('--accent-2')); g.addColorStop(1, css('--accent'));
+  const g = x.createLinearGradient(cx - R, 0, cx + R, 0); g.addColorStop(0, css('--accent')); g.addColorStop(1, css('--accent-2'));
   x.strokeStyle = g; x.lineWidth = 6; x.beginPath(); x.arc(cx, cy, R, a0, a0 + frac * (a1 - a0)); x.stroke();
   // ticks
   const step = max > 12000 ? 2000 : 1000;
@@ -134,7 +142,7 @@ export function drawTacho(canvas, s) {
   }
   // needle
   const an = A(s.rpm);
-  x.strokeStyle = css('--accent'); x.lineWidth = 3;
+  x.strokeStyle = css('--accent-2'); x.lineWidth = 3;
   x.beginPath(); x.moveTo(cx - Math.cos(an) * 10, cy - Math.sin(an) * 10); x.lineTo(cx + Math.cos(an) * (R - 8), cy + Math.sin(an) * (R - 8)); x.stroke();
   x.fillStyle = css('--fg'); x.beginPath(); x.arc(cx, cy, 5, 0, Math.PI * 2); x.fill();
   // readouts
@@ -142,14 +150,14 @@ export function drawTacho(canvas, s) {
   x.fillText(`${Math.round(s.speed)}`, cx, cy + R * 0.5);
   x.font = `600 10px ${FONT}`; x.fillStyle = css('--muted');
   x.fillText('KM/H', cx, cy + R * 0.66);
-  x.font = `700 ${Math.round(R * 0.22)}px ${FONT}`; x.fillStyle = css('--accent');
+  x.font = `700 ${Math.round(R * 0.22)}px ${FONT}`; x.fillStyle = css('--accent-2');
   x.fillText(s.ev ? 'D' : s.gear ? String(s.gear) : 'N', cx, cy - R * 0.32);
   x.font = `600 10px ${FONT}`; x.fillStyle = css('--muted');
   x.fillText(`${Math.round(s.rpm)} rpm`, cx, cy - R * 0.08);
   if (s.boostOn) {
     const bw = R * 1.1, bx = cx - bw / 2, by = h - 8;
     x.fillStyle = css('--grid'); x.fillRect(bx, by, bw, 3);
-    x.fillStyle = css('--accent-2'); x.fillRect(bx, by, bw * Math.max(0, Math.min(1, s.boost)), 3);
+    x.fillStyle = css('--accent'); x.fillRect(bx, by, bw * Math.max(0, Math.min(1, s.boost)), 3);
   }
 }
 

@@ -4,7 +4,7 @@ import { torqueAt } from '../sim/powertrain.js';
 
 export class EngineAudio {
   constructor() {
-    this.ctx = null; this.node = null; this.dsp = null; this.ready = false; this.volume = 0.75;
+    this.ctx = null; this.node = null; this.dsp = null; this.ready = false; this.volume = 0.75; this.space = 'garage';
     this.pending = [];
   }
 
@@ -18,8 +18,17 @@ export class EngineAudio {
     comp.threshold.value = -14; comp.knee.value = 12; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.12;
     const lowShelf = ctx.createBiquadFilter(); lowShelf.type = 'lowshelf'; lowShelf.frequency.value = 140; lowShelf.gain.value = 4;
     const gain = ctx.createGain(); gain.gain.value = this.volume;
-    lowShelf.connect(comp); comp.connect(gain); gain.connect(ctx.destination);
-    this.out = gain; this.inp = lowShelf;
+    // The synthesiser is bone dry. A real engine is always heard in a space: the hard walls of a
+    // workshop, or the open road. A short convolution reverb (run natively by the browser, so it
+    // costs nothing on the script side) supplies that room.
+    const dry = ctx.createGain(); dry.gain.value = 1;
+    const wet = ctx.createGain(); wet.gain.value = SPACES[this.space] ?? SPACES.garage;
+    let conv = null;
+    try { conv = ctx.createConvolver(); conv.buffer = roomImpulse(ctx); } catch (e) { conv = null; }
+    lowShelf.connect(dry); dry.connect(comp);
+    if (conv) { lowShelf.connect(conv); conv.connect(wet); wet.connect(comp); }
+    comp.connect(gain); gain.connect(ctx.destination);
+    this.out = gain; this.inp = lowShelf; this.wet = wet;
     let ok = false;
     if (ctx.audioWorklet && window.AudioWorkletNode) {
       try {
@@ -29,10 +38,21 @@ class PakSwapEngine extends AudioWorkletProcessor {
   process(inputs, outputs) { const o = outputs[0]; if (!o || !o[0]) return true; this.dsp.process(o[0], o[1] || new Float32Array(o[0].length), o[0].length); return true; }
 }
 registerProcessor('pakswap-engine', PakSwapEngine);`;
-        const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-        await ctx.audioWorklet.addModule(url);
+        // A page opened from disk (the desktop app, or the single HTML file) has an opaque origin,
+        // and worklets refuse blob: URLs there. A data: URL loads everywhere, so it goes first.
+        // Without this the synthesiser silently fell back to the main thread.
+        const sources = [
+          () => 'data:application/javascript;charset=utf-8,' + encodeURIComponent(src),
+          () => URL.createObjectURL(new Blob([src], { type: 'application/javascript' })),
+        ];
+        let loaded = false;
+        for (const make of sources) {
+          try { await ctx.audioWorklet.addModule(make()); loaded = true; break; } catch (e) { /* try the next form */ }
+        }
+        if (!loaded) throw new Error('worklet module refused');
         this.node = new AudioWorkletNode(ctx, 'pakswap-engine', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
         this.post = (m) => this.node.port.postMessage(m);
+        this.worklet = true;
         ok = true;
       } catch (e) { ok = false; }
     }
@@ -55,9 +75,39 @@ registerProcessor('pakswap-engine', PakSwapEngine);`;
   setState(s) { if (this.ready) this.post({ type: 'state', state: s }); }
   trigger(name, value) { if (this.ready) this.post({ type: 'trigger', name, value }); }
   setVolume(v) { this.volume = v; if (this.out) this.out.gain.setTargetAtTime(v, this.ctx.currentTime, 0.05); }
+  // 'garage' (studio) or 'open' (driving outdoors)
+  setSpace(name) { this.space = name; if (this.wet) this.wet.gain.setTargetAtTime(SPACES[name] ?? SPACES.garage, this.ctx.currentTime, 0.25); }
+}
+
+const SPACES = { garage: 0.2, open: 0.06 };
+
+// Impulse response of a medium hard-walled room: a handful of early reflections, then a diffuse
+// tail that gets darker as it decays.
+function roomImpulse(ctx) {
+  const sr = ctx.sampleRate, len = Math.floor(sr * 1.15);
+  const buf = ctx.createBuffer(2, len, sr);
+  let seed = 20240917;
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 * 2 - 1; };
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    let lp = 0;
+    for (let i = 0; i < len; i++) {
+      const t = i / sr;
+      // diffuse tail starts after the first reflections; the low-pass closes over time
+      const env = t < 0.012 ? 0 : Math.exp(-(t - 0.012) / 0.17);
+      const k = 0.5 * Math.exp(-t / 0.35) + 0.06;
+      lp += (rnd() - lp) * k;
+      d[i] = lp * env * 0.6;
+    }
+    // early reflections off the floor, walls and ceiling (slightly different left and right)
+    const taps = ch === 0 ? [[0.0071, 0.5], [0.0133, -0.36], [0.0212, 0.3], [0.0317, -0.22], [0.0441, 0.16]] : [[0.0083, 0.46], [0.0149, 0.34], [0.0237, -0.28], [0.0349, 0.2], [0.0473, -0.15]];
+    for (const [tt, g] of taps) { const i = Math.floor(tt * sr); if (i < len) d[i] += g; }
+  }
+  return buf;
 }
 
 function smooth(a, b, x) { if (x <= a) return 0; if (x >= b) return 1; const t = (x - a) / (b - a); return t * t * (3 - 2 * t); }
+const NONE = Object.freeze([]); // returned when there are no events, so idle frames allocate nothing
 
 // Free-revving engine (neutral gear): throttle in, rpm/boost/cut events out.
 // Phases: off -> glow (diesels) -> crank (starter turning the engine) -> flare (caught, revs
@@ -208,5 +258,5 @@ export class RevSim {
     return { rpm: this.rpm, load: Math.max(this.thr, 0.08 + flareLoad), boost: Math.max(0, this.boost), cut, on: 1, starter: 0, crank: 0 };
   }
 
-  drain() { const e = this.events; this.events = []; return e; }
+  drain() { if (!this.events.length) return NONE; const e = this.events; this.events = []; return e; }
 }

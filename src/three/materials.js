@@ -1,5 +1,5 @@
-// Materials. The body paint is a MeshPhysicalMaterial with an injected object-space livery,
-// panel-gap and carbon-hood layer so liveries need no UV unwrap.
+// Materials. The body paint is a MeshPhysicalMaterial with an injected car-space livery,
+// panel-gap, carbon-hood and metallic-flake layer, so liveries need no UV unwrap.
 import * as THREE from 'three';
 import { carbonTexture, truckArtTexture, camoTexture, checkerTexture } from './textures.js';
 
@@ -19,15 +19,18 @@ export function makePaintMaterial() {
     uHood: { value: new THREE.Vector4(9, 9, 0, 0) }, // hood front x, cowl x, half width, carbon flag
     uDeck: { value: new THREE.Vector4(9, 9, 0, 0) }, // deck start x, tail x, half width, enabled
     uSeamOn: { value: 1 },
-    uOrigin: { value: new THREE.Vector3() }, // world position of the car body group (ride height)
+    uFlake: { value: 0 }, // metallic flake strength
+    // world -> car body transform, so the pattern stays put on the body wherever the car is
+    // (studio turntable, or driving and leaning in the open world)
+    uCarInv: { value: new THREE.Matrix4() },
   };
   mat.userData.u = u;
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, u);
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vObjPos;\nvarying vec3 vObjNormal;\nuniform vec3 uOrigin;')
+      .replace('#include <common>', '#include <common>\nvarying vec3 vObjPos;\nvarying vec3 vObjNormal;\nuniform mat4 uCarInv;')
       // car-space position so liveries and seams line up across separate parts (mirrors, spoilers, scoops)
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjPos = (modelMatrix * vec4(position, 1.0)).xyz - uOrigin;\nvObjNormal = mat3(modelMatrix) * normal;');
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjPos = (uCarInv * (modelMatrix * vec4(position, 1.0))).xyz;\nvObjNormal = mat3(uCarInv) * (mat3(modelMatrix) * normal);');
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', `#include <common>
 varying vec3 vObjPos;
@@ -43,6 +46,7 @@ uniform vec2 uSeamY;
 uniform vec4 uHood;
 uniform vec4 uDeck;
 uniform float uSeamOn;
+uniform float uFlake;
 float band(float v, float a, float b) {
   float w = max(fwidth(v), 1e-4) * 1.2;
   return smoothstep(a - w, a + w, v) * (1.0 - smoothstep(b - w, b + w, v));
@@ -57,6 +61,10 @@ vec3 triplanar(sampler2D t, vec3 p, vec3 n, float s) {
   vec3 cy = texture2D(t, p.xz * s).rgb;
   vec3 cz = texture2D(t, p.xy * s).rgb;
   return cx * b.x + cy * b.y + cz * b.z;
+}
+vec3 flakeDir(vec3 c) {
+  vec3 h = fract(sin(vec3(dot(c, vec3(127.1, 311.7, 74.7)), dot(c, vec3(269.5, 183.3, 246.1)), dot(c, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+  return h * 2.0 - 1.0;
 }
 float carbonMaskV = 0.0;`)
       .replace('#include <color_fragment>', `#include <color_fragment>
@@ -114,28 +122,45 @@ float carbonMaskV = 0.0;`)
 }`)
       .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
 metalnessFactor = mix(metalnessFactor, 0.25, carbonMaskV);
-roughnessFactor = mix(roughnessFactor, 0.32, carbonMaskV);`);
+roughnessFactor = mix(roughnessFactor, 0.32, carbonMaskV);`)
+      // metallic flakes: tiny mirrors under the lacquer tilt the base layer's normal while the
+      // clear coat above stays smooth. They fade out once a flake is smaller than a pixel, so the
+      // paint sparkles close up and never shimmers from far away.
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+if (uFlake > 0.001 && carbonMaskV < 0.5) {
+  float sc = 520.0;
+  float fw = max(length(dFdx(vObjPos)), length(dFdy(vObjPos))) * sc;
+  float fk = uFlake * (1.0 - smoothstep(0.45, 1.3, fw));
+  if (fk > 0.0) {
+    vec3 fd = flakeDir(floor(vObjPos * sc)) + 0.5 * flakeDir(floor(vObjPos * sc * 2.03) + 17.0);
+    vec3 fv = (viewMatrix * vec4(fd, 0.0)).xyz;
+    normal = normalize(normal + fv * fk * 0.16);
+  }
+}`);
   };
-  mat.customProgramCacheKey = () => 'pakswap-paint-v2';
+  mat.customProgramCacheKey = () => 'pakswap-paint-v4';
   return mat;
 }
 
 export function applyPaint(mat, color, finish) {
-  const c = new THREE.Color(color);
-  mat.color.copy(c);
-  mat.iridescence = 0;
-  mat.sheen = 0;
+  mat.color.set(color);
+  // clearcoat, iridescence and sheen bump the material version themselves when they switch
+  // on or off, so no forced shader refresh is needed here
+  let irid = 0, flake = 0;
   switch (finish) {
     case 'gloss': mat.metalness = 0.05; mat.roughness = 0.32; mat.clearcoat = 1; mat.clearcoatRoughness = 0.03; break;
-    case 'metallic': mat.metalness = 0.55; mat.roughness = 0.34; mat.clearcoat = 1; mat.clearcoatRoughness = 0.04; break;
-    case 'pearl': mat.metalness = 0.35; mat.roughness = 0.3; mat.clearcoat = 1; mat.clearcoatRoughness = 0.03; mat.iridescence = 0.9; mat.iridescenceIOR = 1.5; mat.iridescenceThicknessRange = [180, 720]; break;
+    case 'metallic': mat.metalness = 0.6; mat.roughness = 0.36; mat.clearcoat = 1; mat.clearcoatRoughness = 0.035; flake = 0.9; break;
+    case 'pearl': mat.metalness = 0.35; mat.roughness = 0.3; mat.clearcoat = 1; mat.clearcoatRoughness = 0.03; irid = 0.9; flake = 0.5; break;
     case 'matte': mat.metalness = 0.08; mat.roughness = 0.82; mat.clearcoat = 0; break;
-    case 'satin': mat.metalness = 0.4; mat.roughness = 0.55; mat.clearcoat = 0.35; mat.clearcoatRoughness = 0.45; break;
-    case 'candy': mat.metalness = 0.75; mat.roughness = 0.22; mat.clearcoat = 1; mat.clearcoatRoughness = 0.02; break;
+    case 'satin': mat.metalness = 0.4; mat.roughness = 0.55; mat.clearcoat = 0.35; mat.clearcoatRoughness = 0.45; flake = 0.25; break;
+    case 'candy': mat.metalness = 0.75; mat.roughness = 0.24; mat.clearcoat = 1; mat.clearcoatRoughness = 0.02; flake = 0.7; break;
     case 'chrome': mat.metalness = 1; mat.roughness = 0.06; mat.clearcoat = 0.3; mat.clearcoatRoughness = 0.05; break;
     default: break;
   }
-  mat.needsUpdate = true;
+  mat.sheen = 0;
+  mat.iridescence = irid;
+  if (irid > 0) { mat.iridescenceIOR = 1.5; mat.iridescenceThicknessRange = [180, 720]; }
+  mat.userData.u.uFlake.value = flake;
 }
 
 export function applyLivery(mat, livery, color, paint) {
@@ -148,18 +173,27 @@ export function applyLivery(mat, livery, color, paint) {
   else u.uLiveryTex.value = carbonTexture();
 }
 
+// Window glass. Reflections stay bright however light the tint is: the alpha of a fragment is
+// raised by the light it mirrors, the way real glass shows the sky over a dark cabin.
 export function makeGlassMaterial() {
-  return new THREE.MeshPhysicalMaterial({
-    color: 0x0c1218, metalness: 0, roughness: 0.04, transparent: true, opacity: 0.6,
-    side: THREE.DoubleSide, depthWrite: false, envMapIntensity: 1.6, clearcoat: 1, clearcoatRoughness: 0.02,
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0x0c1218, metalness: 0, roughness: 0.03, transparent: true, opacity: 0.6,
+    side: THREE.DoubleSide, depthWrite: false, envMapIntensity: 1.4, clearcoat: 1, clearcoatRoughness: 0.02,
   });
+  mat.onBeforeCompile = (sh) => {
+    sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', `diffuseColor.a = clamp(diffuseColor.a + min(dot(outgoingLight, vec3(0.34)), 1.0) * 0.7, 0.0, 1.0);
+outgoingLight = min(outgoingLight, vec3(2.2));
+#include <opaque_fragment>`);
+  };
+  mat.customProgramCacheKey = () => 'pakswap-glass-v1';
+  return mat;
 }
 
+// tint = how dark the film is, in percent
 export function setTint(glass, tint) {
   const t = Math.max(0, Math.min(95, tint)) / 100;
-  glass.opacity = 0.7 + t * 0.29;
+  glass.opacity = 0.4 + 0.57 * Math.pow(t, 0.8);
   glass.color.setRGB(0.03 * (1 - t) + 0.006, 0.042 * (1 - t) + 0.008, 0.055 * (1 - t) + 0.011);
-  glass.needsUpdate = true;
 }
 
 export const MAT = {};

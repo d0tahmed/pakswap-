@@ -577,10 +577,10 @@ export function buildOpenWorld(opts = {}) {
     const dl = Math.hypot((x - lake.x) / lake.rx, (y - lake.y) / lake.ry);
     if (h < lake.level - 0.25 && dl < 1.5) return WORLD_SURFACES[S_WATER];
     if (h < lake.level + 1.4 && dl < 1.7) return WORLD_SURFACES[S_SAND];
-    if (y > 500) { const g = HF.gradAt(x, y); if (g[0] * g[0] + g[1] * g[1] > 0.45) return WORLD_SURFACES[S_ROCK]; }
+    if (y > 500) { const g = HF.gradAt(x, y, tmpS); if (g[0] * g[0] + g[1] * g[1] > 0.45) return WORLD_SURFACES[S_ROCK]; }
     return WORLD_SURFACES[S_GRASS];
   };
-  const tmpG = [0, 0];
+  const tmpG = [0, 0], tmpS = [0, 0];
   const heightAt = (x, y) => HF.heightAt(x, y);
   const gradAt = (x, y) => HF.gradAt(x, y, tmpG);
   // height the wheels sit on (raised sidewalks and kerbs)

@@ -446,6 +446,7 @@ export function buildLayout() {
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 export const CONE_R = 0.2;
 const ZERO2 = [0, 0];
+const ZERO2E = Object.freeze([]);
 
 export class WorldPhysics {
   constructor(layout) {
@@ -460,7 +461,7 @@ export class WorldPhysics {
   surfaceAt(x, y) { return this.L.surfaceAt(x, y); }
   heightAt(x, y) { return this.L.heightAt ? this.L.heightAt(x, y) : 0; }
   groundAt(x, y) { return this.L.groundAt ? this.L.groundAt(x, y) : 0; }
-  gradAt(x, y) { return this.L.gradAt ? this.L.gradAt(x, y) : ZERO2; }
+  gradAt(x, y, out) { return this.L.gradAt ? this.L.gradAt(x, y, out) : ZERO2; }
 
   resetCones() {
     for (const c of this.cones) Object.assign(c, { x: c.x0, y: c.y0, vx: 0, vy: 0, z: 0, vz: 0, yaw: 0, spin: 0, tip: 0, moving: false, down: false });
@@ -470,7 +471,8 @@ export class WorldPhysics {
   // box: oriented box of the car (centre, cos/sin of heading, half length/width, sample points)
   collide(box, car) {
     const L = this.L, B = L.bounds, GC = L.GC;
-    const hits = [];
+    const hits = this.hits || (this.hits = []);
+    hits.length = 0;
     const { cx, cy, cp, sp, hl, hw, pts } = box;
     const rad = Math.hypot(hl, hw) + 1.2;
     const gx0 = Math.max(0, Math.floor((cx - rad - B.x0) / GC)), gx1 = Math.min(L.gw - 1, Math.floor((cx + rad - B.x0) / GC));
@@ -494,7 +496,7 @@ export class WorldPhysics {
       out.nx = nlx * cp - nly * sp; out.ny = nlx * sp + nly * cp; out.depth = depth;
       return true;
     };
-    const tmp = {};
+    const tmp = this.tmpHit || (this.tmpHit = { px: 0, py: 0, nx: 0, ny: 0, depth: 0 });
     for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
       for (const ref of L.cells[gy * L.gw + gx]) {
         const key = ref >= 0 ? ref : nW - 1 - ref;
@@ -596,5 +598,5 @@ export class WorldPhysics {
     }
   }
 
-  drain() { const e = this.events; this.events = []; return e; }
+  drain() { if (!this.events.length) return ZERO2E; const e = this.events; this.events = []; return e; }
 }

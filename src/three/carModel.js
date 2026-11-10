@@ -33,6 +33,11 @@ export class CarModel {
     this.glass = makeGlassMaterial();
     this.trimMat = this.M.trim;
     this.materials = [this.paint, this.glass, this.roofMat, this.trimMat, this.M.under];
+    // the paint shader works in car-body space: hand it the inverse of the body's transform
+    // every time a painted part is drawn (the body moves in drive mode and with ride height)
+    this.carInv = new THREE.Matrix4();
+    const sync = () => { if (this.body) this.carInv.copy(this.body.matrixWorld).invert(); };
+    for (const m of [this.paint, this.roofMat]) { m.userData.u.uCarInv.value = this.carInv; m.onBeforeRender = sync; }
     this.xray = false;
     this.night = false;
     this.flames = [];
@@ -66,15 +71,39 @@ export class CarModel {
     this.buildLights();
     this.applyVisuals(cfg);
     this.setRide(cfg);
+    this.xrayApplied = null;
     this.setXray(this.xray);
     this.setNight(this.night);
-    // solid parts cast real shadows onto the studio floor
-    for (const grp of [this.body, this.wheelRoot]) grp.traverse((o) => {
+    this.shadowFlags(this.body); this.shadowFlags(this.wheelRoot);
+    this.changed();
+  }
+
+  // Tell the scene that something visible changed, so it draws a new frame (and shadow map).
+  changed() { if (this.onChange) this.onChange(); }
+
+  // solid parts cast real shadows onto the studio floor
+  shadowFlags(grp) {
+    if (!grp) return;
+    grp.traverse((o) => {
       if (!o.isMesh) return;
       const m = Array.isArray(o.material) ? o.material[0] : o.material;
-      o.castShadow = !(m && (m.transparent || m.blending === THREE.AdditiveBlending));
+      o.castShadow = !(m && (m.transparent || m.blending === THREE.AdditiveBlending || m.depthWrite === false));
     });
     if (this.bodyMesh) this.bodyMesh.castShadow = true;
+  }
+
+  // Free the GPU resources of a subtree. Geometry from shared caches and the long-lived
+  // materials (paint, glass, the shared trim set) are left alone.
+  free(obj) {
+    if (!obj) return;
+    if (!this.keepMats) this.keepMats = new Set([this.paint, this.roofMat, this.glass, ...Object.values(this.M).filter((m) => m && m.isMaterial)]);
+    const keep = this.keepMats;
+    obj.traverse((m) => {
+      if (!(m.isMesh || m.isLineSegments || m.isLine || m.isPoints)) return;
+      if (m.geometry && !m.geometry.userData.shared && !m.userData.sharedGeo) m.geometry.dispose();
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      for (const mt of mats) if (mt && !keep.has(mt) && !mt.userData.shared) mt.dispose();
+    });
   }
 
   // A user-loaded 3D model replaces the generated body and wheels; engine X-ray keeps working.
@@ -88,6 +117,7 @@ export class CarModel {
     }
     if (this.cfg) this.setRide(this.cfg);
     this.applyCustomVisibility();
+    this.changed();
   }
 
   applyCustomVisibility() {
@@ -104,20 +134,16 @@ export class CarModel {
 
   dispose() {
     if (!this.body) return;
-    const keep = new Set([this.paint, this.roofMat, this.glass, ...Object.values(this.M)]);
-    const kill = (o) => {
-      o.traverse((m) => {
-        if (m.isMesh || m.isInstancedMesh || m.isLineSegments || m.isPoints) {
-          if (!m.userData.sharedGeo) m.geometry?.dispose();
-          const mats = Array.isArray(m.material) ? m.material : [m.material];
-          for (const mt of mats) if (mt && !keep.has(mt) && !mt.userData?.shared) mt.dispose();
-        }
-      });
-    };
-    if (this.wheels) for (const w of this.wheels) disposeWheel(w);
-    kill(this.body); kill(this.wheelRoot);
+    // wheels hold reference-counted geometry and textures, so they go first
+    if (this.wheels) for (const w of this.wheels) { w.removeFromParent(); disposeWheel(w); }
+    if (this.spare) { this.spare.removeFromParent(); disposeWheel(this.spare); }
+    for (const pm of this.plateMats || []) { TX.releasePlate(pm.map); pm.map = null; }
+    this.free(this.body); this.free(this.wheelRoot);
     this.root.remove(this.body); this.root.remove(this.wheelRoot);
-    this.body = null;
+    this.body = null; this.wheelRoot = null;
+    this.wheels = null; this.spare = null; this.plateMats = null; this.shadow = null; this.wheelShadows = null;
+    this.exhaust = null; this.engineGroup = null; this.bayBox = null; this.kits = null; this.details = null; this.interior = null;
+    this.headlights = null; this.taillights = null; this.lightbarLens = null; this.glowPlane = null; this.bodyMesh = null; this.liners = null;
     this.flames = [];
   }
 
@@ -599,7 +625,7 @@ export class CarModel {
       const p = this.patch('rear', { z0: -g.W * 0.36, z1: g.W * 0.36, y0: g.zBelt + 0.02, y1: g.H - 0.16 }, 8, 4, 0.004, m);
       if (p) det.add(p);
       if (car.body === 'jeep') {
-        const sp = buildWheel({ R: g.R, rim: g.tyre.d, width: g.tyre.w / 1000, style: 'offroad', rimColor: '#2a2c30', tyres: 'at', caliper: '#222' });
+        const sp = buildWheel({ R: g.R, rim: g.tyre.d, width: g.tyre.w / 1000, label: car.tyre.replace(/R/, ' R'), style: 'offroad', rimColor: '#2a2c30', tyres: 'at', caliper: '#222' });
         sp.rotation.y = -Math.PI / 2;
         sp.position.set(g.xTail - g.tyre.w / 2000 - 0.02, g.zBelt - 0.05, 0);
         sp.children.forEach((c) => { if (!c.isGroup) c.visible = false; });
@@ -662,6 +688,7 @@ export class CarModel {
     const glow = new THREE.Mesh(new THREE.PlaneGeometry(g.L * 1.55, g.W * 2.5), glowM);
     glow.rotation.x = -Math.PI / 2; glow.position.y = 0.012;
     glow.renderOrder = 1;
+    glow.layers.set(1);
     this.wheelRoot.add(glow);
     this.glowPlane = glow;
   }
@@ -709,7 +736,7 @@ export class CarModel {
 
   buildExhaust() {
     const g = this.geo, cfg = this.cfg;
-    if (this.exhaust) { this.body.remove(this.exhaust); this.exhaust.traverse((o) => { if (o.isMesh) o.geometry.dispose(); }); }
+    if (this.exhaust) { this.body.remove(this.exhaust); this.free(this.exhaust); }
     const grp = new THREE.Group(); this.exhaust = grp; this.body.add(grp);
     this.flames = [];
     const ev = this.info.engine.fuel === 'electric';
@@ -739,6 +766,9 @@ export class CarModel {
       grp.add(fl, fl2);
       this.flames.push(fl, fl2);
     }
+    this.flamesOn = false;
+    this.shadowFlags(grp);
+    grp.visible = !this.custom;
   }
 
   buildArchLiners() {
@@ -816,7 +846,8 @@ export class CarModel {
   buildKits() {
     const g = this.geo, car = this.car, cfg = this.cfg;
     const K = this.kits;
-    while (K.children.length) { const c = K.children.pop(); c.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); } }); }
+    for (const c of K.children.slice()) { K.remove(c); this.free(c); }
+    this.lightbarLens = null;
     const trim = this.M.trim;
     const carbonish = cfg.hood === 'carbon' ? this.M.carbon : trim;
     if (cfg.lip) {
@@ -991,6 +1022,7 @@ export class CarModel {
       K.add(th);
     }
     if (this.cage) this.cage.visible = !!cfg.cage;
+    this.shadowFlags(K);
   }
 
   halfRingWidthAt(x) {
@@ -1012,8 +1044,9 @@ export class CarModel {
     const width = ((info.veh ? info.veh.tyreW : g.tyre.w) / 1000) * 1.0;
     const rim = cfg.rimSize || g.tyre.d;
     const chrome = (cfg.rimColor || '').toLowerCase() === '#f4f4f4';
+    const label = info.veh ? `${info.veh.tyreW}/${info.veh.aspect} R${rim}` : this.car.tyre.replace(/R/, ' R');
     for (const [xa, front] of [[g.xF, true], [g.xR, false]]) for (const s of [1, -1]) {
-      const w = buildWheel({ R, rim, width, style: cfg.rimStyle, rimColor: cfg.rimColor, chrome, caliper: cfg.caliper, bbk: cfg.brakes === 'bbk' || cfg.brakes === 'ceramic', ceramic: cfg.brakes === 'ceramic', tyres: cfg.tyres, classic: this.car.era === 'classic', caliperAngle: front ? 2.4 : 2.6, lugs: this.car.kerb < 900 ? 4 : 5 });
+      const w = buildWheel({ R, rim, width, label, style: cfg.rimStyle, rimColor: cfg.rimColor, chrome, caliper: cfg.caliper, bbk: cfg.brakes === 'bbk' || cfg.brakes === 'ceramic', ceramic: cfg.brakes === 'ceramic', tyres: cfg.tyres, classic: this.car.era === 'classic', caliperAngle: front ? 2.4 : 2.6, lugs: this.car.kerb < 900 ? 4 : 5 });
       const zOut = g.hw(xa) - width / 2 - 0.018 + (cfg.widebody ? 0.03 : 0);
       w.position.set(xa, R, s * zOut);
       w.userData.side = s;
@@ -1021,23 +1054,35 @@ export class CarModel {
       this.wheelRoot.add(w);
       this.wheels.push(w);
     }
-    const sh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: TX.shadowTexture(), transparent: true, depthWrite: false, opacity: 0.85, color: '#000' }));
-    sh.rotation.x = -Math.PI / 2; sh.position.y = 0.006; sh.scale.set(g.L * 1.18, g.W * 1.32, 1); sh.renderOrder = 1;
-    this.wheelRoot.add(sh);
-    this.shadow = sh;
-    this.wheelShadows = [];
-    for (const w of this.wheels) {
-      const s2 = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), sh.material);
-      s2.rotation.x = -Math.PI / 2; s2.position.set(w.position.x, 0.008, w.position.z); s2.scale.set(R * 1.6, width * 1.8, 1);
-      this.wheelRoot.add(s2);
-      this.wheelShadows.push(s2);
+    // soft contact shadows on the floor: one under the body, one under each tyre. They are made
+    // once per car and only moved when the wheels change.
+    if (!this.shadow) {
+      const geo = new THREE.PlaneGeometry(1, 1);
+      const mat = new THREE.MeshBasicMaterial({ map: TX.shadowTexture(), transparent: true, depthWrite: false, opacity: 0.85, color: '#000' });
+      const sh = new THREE.Mesh(geo, mat);
+      sh.rotation.x = -Math.PI / 2; sh.position.y = 0.006; sh.scale.set(g.L * 1.18, g.W * 1.32, 1); sh.renderOrder = 1;
+      sh.layers.set(1);
+      this.wheelRoot.add(sh);
+      this.shadow = sh;
+      this.wheelShadows = [];
+      for (let i = 0; i < 4; i++) {
+        const s2 = new THREE.Mesh(geo, mat);
+        s2.rotation.x = -Math.PI / 2; s2.renderOrder = 1;
+        s2.layers.set(1);
+        this.wheelRoot.add(s2);
+        this.wheelShadows.push(s2);
+      }
     }
+    this.wheels.forEach((w, i) => { const s2 = this.wheelShadows[i]; s2.position.set(w.position.x, 0.008, w.position.z); s2.scale.set(R * 1.6, width * 1.8, 1); });
+    this.shadowFlags(this.wheelRoot);
+    this.applyCustomVisibility();
   }
 
   // ---------------------------------------------------------------- engine
   buildEngine() {
     const g = this.geo, info = this.info;
-    if (this.engineGroup) { this.body.remove(this.engineGroup); this.engineGroup.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose?.(); } }); }
+    if (this.engineGroup) { this.body.remove(this.engineGroup); this.free(this.engineGroup); }
+    this.bayBox = null;
     const grp = new THREE.Group(); this.engineGroup = grp; this.body.add(grp);
     const e = info.engine;
     const fit = info.fit;
@@ -1077,6 +1122,8 @@ export class CarModel {
       this.bayBox = edges;
     }
     grp.visible = this.xray;
+    if (this.bayBox) this.bayBox.visible = this.xray;
+    this.shadowFlags(grp);
     this.engineCenter = new THREE.Vector3(bay.cx ?? g.xF, (bay.floor ?? g.GC) + 0.3, 0);
   }
 
@@ -1109,7 +1156,13 @@ export class CarModel {
     const carbonHood = c.hood === 'carbon' && this.car.body !== 'van';
     this.paint.userData.u.uHood.value.w = carbonHood ? 1 : 0;
     setTint(this.glass, c.tint ?? 25);
-    for (const pm of this.plateMats || []) { pm.map?.dispose(); pm.map = TX.plateTexture(c.plate); pm.needsUpdate = true; }
+    const plate = String(c.plate || '').toUpperCase().slice(0, 10);
+    for (const pm of this.plateMats || []) {
+      if (pm.map && pm.map.userData.plate === plate) continue;
+      const old = pm.map;
+      pm.map = TX.plateTexture(plate);
+      TX.releasePlate(old);
+    }
     if (this.wheels) for (const w of this.wheels) {
       const u = w.userData;
       const chrome = (c.rimColor || '').toLowerCase() === '#f4f4f4';
@@ -1118,39 +1171,47 @@ export class CarModel {
       u.calMat.color.set(c.caliper || '#3a3d42');
     }
     const hl = TX.headlightTextures(this.car.lights, c.headlight || 'white');
-    for (const h of this.headlights || []) { h.material.map = hl.map; h.material.emissiveMap = hl.emissive; h.material.needsUpdate = true; }
+    for (const h of this.headlights || []) { h.material.map = hl.map; h.material.emissiveMap = hl.emissive; }
     const beamCol = c.headlight === 'warm' ? '#ffd9a0' : c.headlight === 'ice' ? '#cfe9ff' : '#f4f8ff';
     for (const b of this.beams || []) b.color.set(beamCol);
     if (this.glowPlane) {
       this.glowPlane.material.color.set(c.underglow || '#000000');
       this.glowPlane.visible = !!c.underglow;
     }
-    if (this.glowLight) { this.glowLight.color.set(c.underglow || '#ffffff'); this.glowLight.intensity = c.underglow ? (this.night ? 6 : 1.5) : 0; }
+    if (this.glowLight) { this.glowLight.color.set(c.underglow || '#ffffff'); this.glowLight.intensity = c.underglow ? (this.night ? 6 : 1.5) : 0; this.glowLight.visible = !!c.underglow; }
     if (this.custom) this.custom.applyPaint(c.paint, c.finish, this.customPaint !== false);
+    this.changed();
   }
 
   setRide(cfg) {
     const o = rideOffset(cfg) / 1000;
     if (this.body) this.body.position.y = o;
     if (this.custom) this.custom.root.position.y = o;
-    for (const m of [this.paint, this.roofMat]) m.userData.u.uOrigin.value.set(0, o, 0);
+    this.changed();
   }
 
   setXray(on) {
     this.xray = on;
     if (!this.body) return;
-    for (const m of [this.paint, this.roofMat]) { m.transparent = on; m.opacity = on ? 0.13 : 1; m.depthWrite = !on; m.needsUpdate = true; }
-    this.glass.visible = !on;
+    // material switches only when the mode really changes: flipping "transparent" costs a
+    // shader program lookup, so it must not happen on every unrelated edit
+    if (this.xrayApplied !== on) {
+      this.xrayApplied = on;
+      for (const m of [this.paint, this.roofMat]) { m.transparent = on; m.opacity = on ? 0.13 : 1; m.depthWrite = !on; m.needsUpdate = true; }
+      this.trimMat.transparent = on; this.trimMat.opacity = on ? 0.15 : 1; this.trimMat.needsUpdate = true;
+      this.M.under.transparent = on; this.M.under.opacity = on ? 0.1 : 1; this.M.under.depthWrite = !on; this.M.under.needsUpdate = true;
+      this.glass.visible = !on;
+      this.M.liner.visible = !on;
+      if (this.bodyMesh) this.bodyMesh.castShadow = true;
+    }
     if (this.interior) this.interior.visible = !on || !!this.cfg.cage;
     if (this.details) this.details.visible = !on;
     if (this.kits) this.kits.visible = !on;
     if (this.engineGroup) this.engineGroup.visible = on;
     if (this.bayBox) this.bayBox.visible = on;
-    this.trimMat.transparent = on; this.trimMat.opacity = on ? 0.15 : 1; this.trimMat.needsUpdate = true;
-    this.M.under.transparent = on; this.M.under.opacity = on ? 0.1 : 1; this.M.under.depthWrite = !on; this.M.under.needsUpdate = true;
-    this.M.liner.visible = !on;
     if (this.custom) this.custom.setXray(on);
     this.applyCustomVisibility();
+    this.changed();
   }
 
   setNight(on) {
@@ -1158,10 +1219,11 @@ export class CarModel {
     const em = on ? 2.4 : 0.35;
     for (const h of this.headlights || []) h.material.emissiveIntensity = em;
     for (const t of this.taillights || []) t.material.emissiveIntensity = on ? 1.6 : 0.3;
-    for (const b of this.beams || []) b.intensity = on ? 30 : 0;
+    for (const b of this.beams || []) { b.intensity = on ? 30 : 0; b.visible = on; }
     if (this.lightbarLens) this.lightbarLens.material.emissiveIntensity = on ? 2 : 0.3;
-    if (this.glowLight) this.glowLight.intensity = this.cfg.underglow ? (on ? 6 : 1.5) : 0;
+    if (this.glowLight) { this.glowLight.intensity = this.cfg.underglow ? (on ? 6 : 1.5) : 0; this.glowLight.visible = !!this.cfg.underglow; }
     if (this.glowPlane) this.glowPlane.material.opacity = on ? 1 : 0.55;
+    this.changed();
   }
 
   spinWheels(dist) {
@@ -1171,6 +1233,7 @@ export class CarModel {
       const r = w.userData.R;
       w.userData.spin.rotation.z = -(dist / r) * ((w.userData.side || 1) < 0 ? -1 : 1);
     }
+    this.changed();
   }
 
   // drive mode: wheel i (FR, FL, RR, RL) spun by its own angle and steered
@@ -1183,7 +1246,10 @@ export class CarModel {
   }
 
   setFlames(on) {
+    if (!on && !this.flamesOn) return;
+    this.flamesOn = on;
     for (const f of this.flames) { f.visible = on; if (on) { f.scale.setScalar(0.7 + Math.random() * 0.6); f.material.opacity = 0.7 + Math.random() * 0.3; } }
+    this.changed();
   }
 }
 

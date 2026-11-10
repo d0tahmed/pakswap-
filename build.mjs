@@ -4,9 +4,11 @@ import path from 'path';
 const root = path.dirname(new URL(import.meta.url).pathname);
 const dist = path.join(root, 'dist');
 fs.mkdirSync(dist, { recursive: true });
-const bundle = async (artifact) => {
+// `node build.mjs --dev` also writes dist/dev.html with readable (unminified) code, for profiling
+const DEV = process.argv.includes('--dev');
+const bundle = async (artifact, minify = true) => {
   const res = await build({
-    entryPoints: [path.join(root, 'src/main.js')], bundle: true, format: 'iife', minify: true, target: 'es2020',
+    entryPoints: [path.join(root, 'src/main.js')], bundle: true, format: 'iife', minify, target: 'es2020',
     write: false, legalComments: 'none', logLevel: 'warning', define: { __ARTIFACT__: artifact ? 'true' : 'false' },
     loader: { '.txt': 'text', '.wasm': 'binary' },
   });
@@ -35,4 +37,9 @@ const bodyArtifact = tpl.replace('{{FONTS_CSS}}', () => fonts).replace('{{APP_JS
 fs.writeFileSync(path.join(dist, 'pakswap-artifact.html'), bodyArtifact);
 const full = `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n${body.replace(/<div class="app"[\s\S]*$/, '')}</head>\n<body>\n${body.slice(body.indexOf('<div class="app"'))}\n</body>\n</html>\n`;
 fs.writeFileSync(path.join(dist, 'index.html'), full);
+if (DEV) {
+  const jsDev = await bundle(false, false);
+  const bodyDev = tpl.replace('{{FONTS_CSS}}', () => fonts).replace('{{APP_JS}}', () => jsDev);
+  fs.writeFileSync(path.join(dist, 'dev.html'), `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n${bodyDev.replace(/<div class="app"[\s\S]*$/, '')}</head>\n<body>\n${bodyDev.slice(bodyDev.indexOf('<div class="app"'))}\n</body>\n</html>\n`);
+}
 console.log('js', (jsApp.length / 1024).toFixed(0) + 'KB', 'artifact', (body.length / 1024).toFixed(0) + 'KB', 'full', (full.length / 1024).toFixed(0) + 'KB');
