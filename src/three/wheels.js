@@ -223,14 +223,25 @@ export function buildWheel(o) {
   // rim
   const chrome = o.chrome || o.style === 'stock' && o.classic;
   const rimMat = new THREE.MeshPhysicalMaterial({ color: new THREE.Color(o.rimColor || '#c9cdd2'), metalness: chrome ? 1 : 0.75, roughness: chrome ? 0.06 : 0.28, clearcoat: chrome ? 0 : 0.8, clearcoatRoughness: 0.08, side: THREE.DoubleSide });
-  const lipMat = o.style === 'dish' ? M.chrome : rimMat;
-  const barrel = new THREE.Mesh(barrelGeometry(rimR, w, o.style === 'dish'), lipMat);
-  spin.add(barrel);
   const faceDepth = o.style === 'offroad' ? 0.03 : 0.022;
   const recess = { dish: w * 0.35, five: w * 0.12, multi: w * 0.08, y: w * 0.1, mesh: w * 0.1, turbine: w * 0.02, offroad: w * 0.1, stock: w * 0.05 }[o.style] ?? w * 0.1;
-  const face = new THREE.Mesh(faceGeometry(o.style, rimR, faceDepth), rimMat);
-  face.position.z = w / 2 - recess;
-  spin.add(face);
+  if (o.style === 'dish') {
+    // deep dish: chrome barrel, painted face
+    spin.add(new THREE.Mesh(barrelGeometry(rimR, w, true), M.chrome));
+    const face = new THREE.Mesh(faceGeometry(o.style, rimR, faceDepth), rimMat);
+    face.position.z = w / 2 - recess;
+    spin.add(face);
+  } else {
+    // barrel and face share the rim paint: one mesh, one draw call
+    spin.add(new THREE.Mesh(acquire(`rim-${o.style}-${rimR.toFixed(3)}-${w.toFixed(3)}`, () => {
+      const b = barrelGeometry(rimR, w, false), f = faceGeometry(o.style, rimR, faceDepth);
+      const fc = f.clone(); fc.translate(0, 0, w / 2 - recess);
+      const bn = b.index ? b.toNonIndexed() : b.clone(), fn = fc.index ? fc.toNonIndexed() : fc;
+      const g = mergeGeometries([bn, fn], false);
+      release(b); release(f); bn.dispose(); if (fn !== fc) fn.dispose(); fc.dispose();
+      return g;
+    }), rimMat));
+  }
   if (o.style === 'dish') {
     const lipRing = new THREE.Mesh(simple(`lipring-${rimR.toFixed(3)}`, () => new THREE.RingGeometry(rimR * 0.82, rimR * 1.0, 48)), M.chrome);
     lipRing.position.z = w / 2 - 0.004; spin.add(lipRing);
@@ -249,29 +260,32 @@ export function buildWheel(o) {
     spin.add(bolts);
   }
   // hub, cap and lugs
-  const back = new THREE.Mesh(simple(`back-${rimR.toFixed(3)}`, () => new THREE.CircleGeometry(rimR * 0.95, 40)), M.darkMetal);
-  back.position.z = -w * 0.25; spin.add(back);
   const capR = o.style === 'stock' ? rimR * 0.62 : rimR * 0.17;
-  let capMat = null;
-  if (o.style === 'stock') capMat = new THREE.MeshStandardMaterial({ color: 0xbfc4c9, roughness: 0.35, metalness: 0.6 });
-  const cap = new THREE.Mesh(simple(`cap-${capR.toFixed(3)}`, () => new THREE.CylinderGeometry(capR, capR * 1.04, 0.022, 32).rotateX(Math.PI / 2)), capMat || M.darkMetal);
-  cap.position.z = w / 2 - recess + 0.012;
-  spin.add(cap);
-  let slotsMat = null;
+  const capZ = w / 2 - recess + 0.012;
+  let capMat = null, slotsMat = null;
   if (o.style === 'stock') {
+    const back = new THREE.Mesh(simple(`back-${rimR.toFixed(3)}`, () => new THREE.CircleGeometry(rimR * 0.95, 40)), M.darkMetal);
+    back.position.z = -w * 0.25; spin.add(back);
+    capMat = new THREE.MeshStandardMaterial({ color: 0xbfc4c9, roughness: 0.35, metalness: 0.6 });
+    const cap = new THREE.Mesh(simple(`cap-${capR.toFixed(3)}`, () => new THREE.CylinderGeometry(capR, capR * 1.04, 0.022, 32).rotateX(Math.PI / 2)), capMat);
+    cap.position.z = capZ; spin.add(cap);
     slotsMat = new THREE.MeshStandardMaterial({ color: 0x2a2d31, roughness: 0.7 });
     const slots = new THREE.Mesh(slotsGeometry(capR), slotsMat);
-    slots.position.z = cap.position.z + 0.012;
+    slots.position.z = capZ + 0.012;
     spin.add(slots);
   } else {
+    // back plate, centre cap and wheel nuts in one dark-metal mesh
     const nL = o.lugs || 5;
-    const lugs = new THREE.Mesh(simple(`lugs-${nL}-${rimR.toFixed(3)}`, () => {
+    spin.add(new THREE.Mesh(simple(`hub-${nL}-${rimR.toFixed(3)}-${w.toFixed(3)}-${recess.toFixed(3)}`, () => {
       const parts = [];
-      for (let i = 0; i < nL; i++) { const b = new THREE.CylinderGeometry(0.009, 0.009, 0.02, 6); b.rotateX(Math.PI / 2); const a = (i / nL) * TAU; b.translate(Math.cos(a) * rimR * 0.27, Math.sin(a) * rimR * 0.27, 0); parts.push(b); }
-      const g = mergeGeometries(parts, false); for (const p of parts) p.dispose(); return g;
-    }), M.chrome);
-    lugs.position.z = w / 2 - recess + 0.006;
-    spin.add(lugs);
+      const back = new THREE.CircleGeometry(rimR * 0.95, 40); back.translate(0, 0, -w * 0.25); parts.push(back);
+      const cap = new THREE.CylinderGeometry(capR, capR * 1.04, 0.022, 32); cap.rotateX(Math.PI / 2); cap.translate(0, 0, capZ); parts.push(cap);
+      for (let i = 0; i < nL; i++) { const b = new THREE.CylinderGeometry(0.009, 0.009, 0.02, 6); b.rotateX(Math.PI / 2); const a = (i / nL) * TAU; b.translate(Math.cos(a) * rimR * 0.27, Math.sin(a) * rimR * 0.27, w / 2 - recess + 0.006); parts.push(b); }
+      const flat = parts.map((p) => (p.index ? p.toNonIndexed() : p));
+      const g = mergeGeometries(flat, false);
+      for (const p of parts) p.dispose(); for (const p of flat) p.dispose();
+      return g;
+    }), M.darkMetal));
   }
   // brake disc and caliper (not spinning)
   const discR = Math.min(rimR * (o.bbk ? 0.86 : 0.76), R * 0.7);

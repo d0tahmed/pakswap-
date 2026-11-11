@@ -593,6 +593,7 @@ function bindEvents() {
   for (const mq of [mqPhone, mqCompact]) mq.addEventListener ? mq.addEventListener('change', onMq) : mq.addListener(onMq);
   S.phone = mqPhone.matches; S.mobile = mqCompact.matches;
   if (S.phone) { $('#stripHolder').appendChild($('#statStrip')); setSoundLab(false); }
+  else if ($('#overlay').clientWidth < 620) setSoundLab(false); // small window: start with the car in view
   window.addEventListener('resize', updateInsets);
 }
 

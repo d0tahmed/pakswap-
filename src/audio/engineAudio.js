@@ -1,5 +1,7 @@
 // Audio graph and the free-revving engine model that drives it.
 import { EngineDSP, soundProfile, startParams } from './dsp.js';
+import { EngineWasm } from './dspWasm.js';
+import wasmBytes from './engine_dsp.wasm';
 import { torqueAt } from '../sim/powertrain.js';
 
 export class EngineAudio {
@@ -32,10 +34,20 @@ export class EngineAudio {
     let ok = false;
     if (ctx.audioWorklet && window.AudioWorkletNode) {
       try {
+        // The synthesiser runs as compiled Rust (WebAssembly, about twice as fast) when the
+        // module loads, and as the JavaScript reference otherwise. Both give the same samples.
         const src = `const EngineDSP = ${EngineDSP.toString()};
+const EngineWasm = ${EngineWasm.toString()};
 class PakSwapEngine extends AudioWorkletProcessor {
-  constructor() { super(); this.dsp = new EngineDSP(sampleRate); this.port.onmessage = (e) => this.dsp.message(e.data); }
-  process(inputs, outputs) { const o = outputs[0]; if (!o || !o[0]) return true; this.dsp.process(o[0], o[1] || new Float32Array(o[0].length), o[0].length); return true; }
+  constructor(o) {
+    super();
+    const bytes = o && o.processorOptions && o.processorOptions.wasm;
+    try { this.dsp = bytes ? new EngineWasm(sampleRate, bytes) : new EngineDSP(sampleRate); } catch (e) { this.dsp = new EngineDSP(sampleRate); }
+    this.port.postMessage({ core: this.dsp instanceof EngineWasm ? 'wasm' : 'js' });
+    this.port.onmessage = (e) => this.dsp.message(e.data);
+    this.spare = new Float32Array(128);
+  }
+  process(inputs, outputs) { const o = outputs[0]; if (!o || !o[0]) return true; this.dsp.process(o[0], o[1] || this.spare, o[0].length); return true; }
 }
 registerProcessor('pakswap-engine', PakSwapEngine);`;
         // A page opened from disk (the desktop app, or the single HTML file) has an opaque origin,
@@ -50,7 +62,8 @@ registerProcessor('pakswap-engine', PakSwapEngine);`;
           try { await ctx.audioWorklet.addModule(make()); loaded = true; break; } catch (e) { /* try the next form */ }
         }
         if (!loaded) throw new Error('worklet module refused');
-        this.node = new AudioWorkletNode(ctx, 'pakswap-engine', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+        this.node = new AudioWorkletNode(ctx, 'pakswap-engine', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { wasm: wasmBytes } });
+        this.node.port.onmessage = (e) => { if (e.data && e.data.core) this.core = e.data.core; };
         this.post = (m) => this.node.port.postMessage(m);
         this.worklet = true;
         ok = true;

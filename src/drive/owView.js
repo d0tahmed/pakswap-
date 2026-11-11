@@ -77,6 +77,8 @@ export class OpenWorldView {
     this.frustum = new THREE.Frustum();
     this.pm = new THREE.Matrix4();
     this.lodT = 0;
+    // how far props and whole cells are drawn, by quality tier: [small, medium, cell range]
+    this.reach = this.q === 'low' ? [260, 800, 1900] : this.q === 'medium' ? [520, 1700, 3400] : [900, 2800, 1e9];
     this.lampPick = { t: 0, idx: new Int32Array(8).fill(-1), d2: new Float64Array(8) };
     this.terrainAt = { x: Infinity, y: Infinity, pending: true };
     this.ms = performance.now() - t0;
@@ -103,12 +105,12 @@ export class OpenWorldView {
       const c = this.cellList[i], bs = c.userData.bs;
       const dx = bs.center.x - cp.x, dy = bs.center.y - cp.y, dz = bs.center.z - cp.z;
       const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - bs.radius;
-      const vis = d < 190 || this.frustum.intersectsSphere(bs);
+      const vis = d < 190 || (d < this.reach[2] && this.frustum.intersectsSphere(bs));
       if (c.visible !== vis) c.visible = vis;
       // small props drop out with distance; checked a few times a second
       if (lod && vis) {
         const ch = c.children;
-        for (let k = 0; k < ch.length; k++) { const o = ch[k], md = o.userData.maxDist; if (md !== undefined) { const v = d < md; if (o.visible !== v) o.visible = v; } }
+        for (let k = 0; k < ch.length; k++) { const o = ch[k], cl = o.userData.cls; if (cl !== undefined) { const v = d < (cl === 9 ? o.userData.maxDist : this.reach[cl]); if (o.visible !== v) o.visible = v; } }
       }
     }
   }
@@ -1322,7 +1324,7 @@ void S_ASPHALT; void S_GRASS;
 
 // ---------------------------------------------------------------- spatial batching
 const CELL = 325; // metres; the map is 16 x 16 of these
-const MAX_DIST = [900, 2800]; // small and medium props stop being drawn beyond these distances
+const ICELL = 650; // instanced props (trees, poles) are grouped in larger cells
 
 function maxScale(m) {
   const e = m.elements;
@@ -1415,7 +1417,7 @@ function mergeStatic(root, skip, disposables, place) {
       const mesh = new THREE.Mesh(part, src.material);
       mesh.castShadow = src.castShadow; mesh.receiveShadow = src.receiveShadow; mesh.renderOrder = src.renderOrder;
       mesh.matrixAutoUpdate = false;
-      if (cls < 2) mesh.userData.maxDist = MAX_DIST[cls];
+      if (cls < 2) mesh.userData.cls = cls;
       disposables.push(part);
       const c = part.boundingSphere.center;
       place(mesh, c.x, c.z);
@@ -1437,7 +1439,7 @@ function splitInstanced(root, skip, place) {
     const groups = new Map();
     for (let i = 0; i < im.count; i++) {
       im.getMatrixAt(i, M); W.multiplyMatrices(im.matrixWorld, M);
-      const id = (Math.floor(W.elements[12] / CELL) + 512) * 4096 + (Math.floor(W.elements[14] / CELL) + 512);
+      const id = (Math.floor(W.elements[12] / ICELL) + 512) * 4096 + (Math.floor(W.elements[14] / ICELL) + 512);
       let g = groups.get(id);
       if (!g) { g = []; groups.set(id, g); }
       g.push(i);
@@ -1457,7 +1459,7 @@ function splitInstanced(root, skip, place) {
       if (part.instanceColor) part.instanceColor.needsUpdate = true;
       part.castShadow = im.castShadow; part.receiveShadow = im.receiveShadow; part.renderOrder = im.renderOrder;
       part.matrixAutoUpdate = false;
-      part.userData.maxDist = im.userData.maxDist ?? (r < 3.2 ? MAX_DIST[0] : r < 9 ? MAX_DIST[1] : undefined);
+      if (im.userData.maxDist !== undefined) { if (im.userData.maxDist !== Infinity) { part.userData.cls = 9; part.userData.maxDist = im.userData.maxDist; } } else if (r < 9) part.userData.cls = r < 3.2 ? 0 : 1;
       place(part, sx / ids.length, sz / ids.length);
       made++;
     }

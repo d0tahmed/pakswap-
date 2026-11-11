@@ -1,0 +1,16 @@
+[package]
+name = "engine-dsp"
+version = "1.0.0"
+edition = "2021"
+description = "PakSwap engine sound synthesiser core (WebAssembly build of src/audio/dsp.js)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

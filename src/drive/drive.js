@@ -325,6 +325,9 @@ export class DriveMode {
   setTime(name, quiet) {
     this.set.time = name;
     const T = this.sky.setTime(name);
+    // the low tier draws a shorter distance; thicker haze hides where the world ends
+    const tq = this.viewQuality;
+    if (this.scene.fog && tq !== 'high') this.scene.fog.density *= tq === 'low' ? 2.6 : 1.5;
     const night = name === 'night';
     this.view.setNight(night);
     this.fx.setLight(night ? 0.32 : name === 'evening' ? 0.78 : 1.0);

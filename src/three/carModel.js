@@ -7,6 +7,31 @@ import { makePaintMaterial, applyPaint, applyLivery, makeGlassMaterial, setTint,
 import { buildWheel, disposeWheel } from './wheels.js';
 import { buildEngineModel, buildBattery } from './engineModel.js';
 import * as TX from './textures.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+
+// Bake the meshes of a group that share one of the long-lived materials into a single mesh per
+// material. Parts the app still needs to reach individually are tagged userData.live.
+function bakeShared(group, shared) {
+  group.updateMatrixWorld(true);
+  const inv = new THREE.Matrix4().copy(group.matrixWorld).invert(), M = new THREE.Matrix4();
+  const by = new Map();
+  group.traverse((o) => {
+    if (!o.isMesh || o.isInstancedMesh || Array.isArray(o.material) || !shared.has(o.material) || o.userData.live || o.geometry.userData.shared) return;
+    let p = o.parent, ok = true; while (p && p !== group) { if (p.userData.live || !p.visible) ok = false; p = p.parent; }
+    if (!ok || !o.visible) return;
+    if (!by.has(o.material)) by.set(o.material, []);
+    by.get(o.material).push(o);
+  });
+  for (const [mat, list] of by) {
+    if (list.length < 2) continue;
+    const geos = list.map((o) => { M.multiplyMatrices(inv, o.matrixWorld); const g = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry.clone(); g.applyMatrix4(M); for (const k of Object.keys(g.attributes)) if (k !== 'position' && k !== 'normal') g.deleteAttribute(k); if (!g.getAttribute('normal')) g.computeVertexNormals(); return g; });
+    let merged = null; try { merged = mergeGeometries(geos, false); } catch (e) { merged = null; }
+    for (const g of geos) g.dispose();
+    if (!merged) continue;
+    for (const o of list) { o.geometry.dispose(); o.removeFromParent(); }
+    group.add(new THREE.Mesh(merged, mat));
+  }
+}
 
 const SEG = { A: 0, B: 1, K: 2, C: 3, D: 4, E: 5, F: 6, G: 7 };
 const NE = 5, NF = 4, NG = 5, NB = 4, NA = 3, ND = 4;
@@ -87,8 +112,12 @@ export class CarModel {
     grp.traverse((o) => {
       if (!o.isMesh) return;
       const m = Array.isArray(o.material) ? o.material[0] : o.material;
-      o.castShadow = !(m && (m.transparent || m.blending === THREE.AdditiveBlending || m.depthWrite === false));
+      // small parts add nothing to the car's shadow but would each be drawn again for it
+      if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+      const big = o.geometry.boundingSphere.radius * Math.max(o.scale.x, o.scale.y, o.scale.z) > 0.2;
+      o.castShadow = big && !(m && (m.transparent || m.blending === THREE.AdditiveBlending || m.depthWrite === false));
     });
+    for (const g of [this.details, this.interior, this.engineGroup]) if (g) g.traverse((o) => { o.castShadow = false; });
     if (this.bodyMesh) this.bodyMesh.castShadow = true;
   }
 
@@ -839,7 +868,9 @@ export class CarModel {
       this.cage.add(new THREE.Mesh(new THREE.TubeGeometry(c, 2, 0.02, 8), tubeM));
     }
     this.cage.visible = false;
+    this.cage.userData.live = true;
     grp.add(this.cage);
+    bakeShared(grp, new Set([M.interior, M.interiorLight]));
   }
 
   // ---------------------------------------------------------------- kits

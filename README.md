@@ -87,6 +87,24 @@ On phones and tablets on-screen pedals, steering and handbrake buttons appear.
 Studio controls: Space = rev, E = start or stop the engine, X = X-ray the engine bay, 1 to 5 = camera
 views, Esc = close dialogs.
 
+## Performance and old hardware
+
+The app is built to stay smooth on old office PCs, not only on gaming machines.
+
+- **Draws only when needed:** an idle studio uses no GPU time; frames are drawn when the camera or
+  the car changes.
+- **Auto quality:** Settings > Graphics quality > *Auto* (the default) watches the frame rate and
+  trades render resolution, then effects, for smoothness. *Low* turns off shadows, reflections and
+  bloom and shortens the draw distance. Settings > Interface > *Solid* switches off the glass blur.
+- **Open world in cells:** scenery is batched per map cell and culled, so only what the camera or
+  the sun's shadow can reach is drawn.
+- **Sound off the main thread:** the engine synthesiser runs in an audio worklet as compiled Rust
+  (WebAssembly), with the JavaScript version as a fallback.
+- **Graphics chip:** any GPU with WebGL 2 (DirectX 10.1 / OpenGL 3.3 class and newer). Chips older
+  than that, such as first-generation Intel HD Graphics, have no WebGL 2; the desktop app then uses
+  the built-in software renderer on the Low tier. The studio stays usable that way, but the open
+  world will not reach a high frame rate without a GPU.
+
 ## Build from source
 
 Node.js 18 or newer.
@@ -94,6 +112,15 @@ Node.js 18 or newer.
 ```bash
 npm install
 npm run build                  # -> dist/index.html, one offline file with everything in it
+```
+
+The sound core is Rust (`native/engine-dsp`). The compiled module is committed at
+`src/audio/engine_dsp.wasm`, so Rust is only needed if you change it:
+
+```bash
+rustup target add wasm32-unknown-unknown
+npm run build:wasm             # rebuilds src/audio/engine_dsp.wasm
+npm test                       # checks the Rust and JavaScript synthesisers give the same samples
 ```
 
 Desktop apps (Electron):
@@ -134,8 +161,9 @@ src/
   three/importer.js   loading, orienting and fitting user 3D models (GLB/glTF/ZIP/FBX/OBJ)
   three/scene.js      studio, lighting, camera
   vendor/draco/       Draco mesh decoder (Apache 2.0) inlined for compressed glTF models
-  audio/dsp.js        engine sound synthesiser (AudioWorklet with ScriptProcessor fallback),
+  audio/dsp.js        engine sound synthesiser, JavaScript reference (AudioWorklet),
                       starter/cranking model and per-car, per-engine sound profiles
+  audio/dspWasm.js    wrapper for the Rust/WebAssembly build of the synthesiser
   audio/engineAudio.js audio graph + engine model (glow, crank, catch, flare, idle, coast)
   ui/charts.js        dyno, acceleration, tachometer, drag strip
   drive/drive.js      drive mode: physics loop, cameras, sound hookup, effects, laps, drift score
@@ -149,6 +177,8 @@ src/
   drive/input.js      keyboard, mouse, gamepad and touch input
   main.js             app controller
   template.html       page shell and styles
+native/engine-dsp/    the synthesiser core in Rust (compiled to WebAssembly)
+test/dsp-parity.mjs   Rust vs JavaScript synthesiser comparison
 build.mjs             bundles everything into dist/index.html (single offline file)
 desktop/              Electron shell for the Windows and Linux builds
 install-linux.sh      installs the Linux build into your home folder and the applications menu

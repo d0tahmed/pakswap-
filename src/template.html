@@ -336,12 +336,15 @@ select.search { appearance: auto; }
   .stat { padding: 8px 9px 7px; }
   .car-title { max-width: 58%; }
 }
-@container stage (max-width: 560px) {
-  .stage-bottom { left: 0; bottom: auto; top: 118px; justify-content: flex-start; }
-  .statstrip { grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 250px; }
+@container stage (max-width: 620px) {
+  /* little room between the panels: the car comes first, the full numbers live in the Specs tab */
+  .stage-bottom { display: none; }
   .stage-top { flex-direction: column; }
   .view-tools { align-items: flex-start; }
   .car-title { max-width: 100%; }
+  .soundlab { width: min(240px, 100%); }
+  .sl-note { display: none; }
+}
 }
 
 /* ---------------- narrower windows */

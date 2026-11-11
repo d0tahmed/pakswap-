@@ -4,6 +4,16 @@ const path = require('path');
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
+// Laptops with two graphics chips: use the fast one, not the power-saving one.
+app.commandLine.appendSwitch('force_high_performance_gpu');
+// Old GPUs without WebGL 2 (first-generation Intel HD Graphics and similar) still get a 3D view
+// through the built-in software renderer instead of a blank stage.
+app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+// one instance only: a second launch focuses the window that is already open
+if (!app.requestSingleInstanceLock()) app.quit();
+app.on('second-instance', () => { const w = BrowserWindow.getAllWindows()[0]; if (w) { if (w.isMinimized()) w.restore(); w.focus(); } });
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -11,12 +21,12 @@ function createWindow() {
     height: 900,
     minWidth: 980,
     minHeight: 640,
-    backgroundColor: '#121110',
+    backgroundColor: '#05070b',
     title: 'PakSwap Studio',
     icon: path.join(__dirname, 'build', 'icon.png'),
     autoHideMenuBar: true,
     show: false,
-    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, spellcheck: false },
+    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, spellcheck: false, backgroundThrottling: true },
   });
   win.once('ready-to-show', () => win.show());
   win.loadFile(path.join(__dirname, 'app', 'index.html'));

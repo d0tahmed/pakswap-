@@ -6,6 +6,8 @@
   "private": true,
   "scripts": {
     "build": "node build.mjs",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path native/engine-dsp/Cargo.toml && node -e \"require('fs').copyFileSync('native/engine-dsp/target/wasm32-unknown-unknown/release/engine_dsp.wasm','src/audio/engine_dsp.wasm')\"",
+    "test": "node test/dsp-parity.mjs",
     "desktop": "node build.mjs && node -e \"const fs=require('fs');fs.mkdirSync('desktop/app',{recursive:true});fs.copyFileSync('dist/index.html','desktop/app/index.html')\" && npm --prefix desktop run dist"
   },
   "dependencies": {

@@ -16,7 +16,7 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { floorTexture, backgroundTexture } from './textures.js';
 
 const TIERS = ['low', 'medium', 'high'];
-const MIN_SCALE = 0.6;
+const MIN_SCALE = 0.5;
 
 // Pick a starting tier from the GPU the browser reports. The governor corrects it either way.
 export function guessTier(gl) {
@@ -24,6 +24,8 @@ export function guessTier(gl) {
   try { const ext = gl.getExtension('WEBGL_debug_renderer_info'); if (ext) name = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || ''); } catch (e) { /* ignore */ }
   const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
   if (/swiftshader|llvmpipe|software|basic render|softpipe/i.test(name)) return 'low';
+  // first to fourth generation Intel graphics and other DX10-era chips
+  if (/intel\(r\) hd graphics( family| [234]\d{3})?(?! [56]\d\d)|gma|g4[15]|q4[35]|mobile intel|geforce (gt )?[2-5]\d\d[m ]|radeon hd [2-6]\d{3}/i.test(name)) return 'low';
   if (mobile) return 'medium';
   if (/(rtx|gtx|radeon rx|radeon pro|arc\(tm\)|arc a\d|apple m\d|geforce (9|1\d|2\d|3\d|4\d)\d\d)/i.test(name)) return 'high';
   if (/intel/i.test(name) && !/iris\(r\) xe|iris xe|arc/i.test(name)) return 'medium';
